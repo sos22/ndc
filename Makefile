@@ -1,4 +1,4 @@
-all: ndc.so test_dlopen test.so
+all: ndc.so test_dlopen test.so test_race1
 
 ndc.so: ndc.po
 	gcc -shared -fPIC -g -o $@ $^
@@ -11,3 +11,6 @@ test_dlopen: test_dlopen.c
 
 test.so: test.po
 	gcc -shared -fPIC -g -o $@ $^
+
+test_race1: test_race1.c
+	gcc -Wall -g -pthread -o $@ $^
