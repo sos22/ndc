@@ -6,6 +6,7 @@
 #include <assert.h>
 #include <elf.h>
 #include <err.h>
+#include <errno.h>
 #include <link.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -541,6 +542,7 @@ loaded_object(const char *name, unsigned long addr,
 	const void *shstrtab;
 	const void *current_instr;
 	const void *end_instr;
+	int relocated;
 
 	if (!addr)
 		return;
@@ -567,8 +569,6 @@ loaded_object(const char *name, unsigned long addr,
 
 	return;
 doit:
-	printf("%s %lx\n", name, addr);
-
 	lo = calloc(sizeof(*lo), 1);
 	lo->nr_instrs_alloced = 128;
 	lo->instrs = malloc(lo->nr_instrs_alloced * sizeof(lo->instrs[0]));
@@ -576,6 +576,11 @@ doit:
 	lo->live = 1;
 	lo->next = first_loaded_object;
 	first_loaded_object = lo;
+
+	if (!strcmp(name, ""))
+		name = program_invocation_name;
+
+	printf("%s %lx\n", name, addr);
 
 	fd = open(name, O_RDONLY);
 	if (fd < 0)
@@ -594,9 +599,10 @@ doit:
 	    hdr->e_ident[1] != 'E' ||
 	    hdr->e_ident[2] != 'L' ||
 	    hdr->e_ident[3] != 'F' ||
-	    hdr->e_type != ET_DYN ||
+	    (hdr->e_type != ET_DYN && hdr->e_type != ET_EXEC) ||
 	    hdr->e_shentsize != sizeof(ElfW(Shdr)))
-		err(1, "%s isn't a valid ELF DSO", name);
+		errx(1, "%s isn't a valid ELF DSO", name);
+	relocated = hdr->e_type == ET_DYN;
 	nr_shdrs = hdr->e_shnum;
 	if (nr_shdrs == 0) {
 		warnx("%s has no section headers?", name);
@@ -613,14 +619,15 @@ doit:
 		    !(shdrs[x].sh_flags & SHF_ALLOC) ||
 		    !(shdrs[x].sh_flags & SHF_EXECINSTR))
 			continue;
-		current_instr =
-			shdrs[x].sh_addr + (void *)hdr;
+		current_instr = (void *)shdrs[x].sh_addr;
+		if (relocated)
+			current_instr += (unsigned long)hdr;
 		end_instr = current_instr + shdrs[x].sh_size;
 		while (current_instr < end_instr) {
 			current_instr += handle_instruction(
 				(const unsigned char *)hdr,
 				current_instr,
-				(void *)addr + ((void *)current_instr - (void *)hdr),
+				relocated ? (void *)addr + ((void *)current_instr - (void *)hdr) : current_instr,
 				lo);
 		}
 	}
