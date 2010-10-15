@@ -60,6 +60,7 @@ set_breakpoint(unsigned long addr,
 	w->ctxt = ctxt;
 	w->prev = NULL;
 	w->old_content = *(unsigned char *)addr;
+	assert(w->old_content != 0xcc);
 	w->next = head_breakpoint;
 	if (head_breakpoint)
 		head_breakpoint->prev = w;
@@ -254,12 +255,48 @@ find_instr_template(const unsigned char *instr,
 	it->modrm_access_type = ACCESS_INVALID;
 	*prefixes = 0;
 
-more_prefixes:
-	if (instr[it->bytes_prefix] == 0x66) {
-		*prefixes |= 1 << PFX_OPSIZE;
+	while (1) {
 		it->bytes_prefix++;
-		goto more_prefixes;
+		switch (instr[it->bytes_prefix-1]) {
+		case 0x26:
+			*prefixes |= 1 << PFX_ES;
+			break;
+		case 0x2e:
+			*prefixes |= 1 << PFX_CS;
+			break;
+		case 0x36:
+			*prefixes |= 1 << PFX_SS;
+			break;
+		case 0x3e:
+			*prefixes |= 1 << PFX_DS;
+			break;
+		case 0x64:
+			*prefixes |= 1 << PFX_FS;
+			break;
+		case 0x65:
+			*prefixes |= 1 << PFX_GS;
+			break;
+		case 0x66:
+			*prefixes |= 1 << PFX_OPSIZE;
+			break;
+		case 0x67:
+			*prefixes |= 1 << PFX_ADDRSIZE;
+			break;
+		case 0xF0:
+			*prefixes |= 1 << PFX_LOCK;
+			break;
+		case 0xF2:
+			*prefixes |= 1 << PFX_REPN;
+			break;
+		case 0xF3:
+			*prefixes |= 1 << PFX_REP;
+			break;
+		default:
+			goto done_prefixes;
+		}
 	}
+done_prefixes:
+	it->bytes_prefix--;
 
 	if (instr[it->bytes_prefix] >= 0x40 && instr[it->bytes_prefix] < 0x4f) {
 		*prefixes |= 1 << PFX_REX_0;
@@ -294,7 +331,9 @@ more_prefixes:
 			it->modrm_access_type = ACCESS_W;
 			break;
 		default:
-			errx(1, "Can't handle instruction %02x %02x\n", instr[it->bytes_prefix], instr[it->bytes_prefix+1]);
+			errx(1, "Can't handle instruction %02x %02x at %p\n",
+			     instr[it->bytes_prefix], instr[it->bytes_prefix+1],
+			     instr);
 		}
 		break;
 
@@ -306,6 +345,7 @@ more_prefixes:
 
 	case 0x01: /* add Ev, Gv */
 	case 0x29: /* sub Ev, Gv */
+	case 0x31: /* xor Ev, Gv */
 		it->modrm_access_type = ACCESS_RW;
 		break;
 
@@ -363,6 +403,7 @@ more_prefixes:
 	case 0x90: /* nop */
 	case 0xc3: /* ret */
 	case 0xc9: /* leave */
+	case 0xf4: /* hlt */
 		break;
 
 	case 0x05: /* add rax, Iz */
@@ -376,7 +417,8 @@ more_prefixes:
 		break;
 
 	default:
-		errx(1, "Can't handle instruction byte %02x\n", instr[it->bytes_prefix]);
+		errx(1, "Can't handle instruction byte %02x at %p", instr[it->bytes_prefix],
+		     instr);
 	}
 }
 
