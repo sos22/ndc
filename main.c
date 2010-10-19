@@ -64,6 +64,34 @@ struct process {
 	struct loaded_object *head_loaded_object;
 };
 
+/* An x86 instruction consists of
+
+   -- Some prefixes
+   -- One or two bytes of opcode
+   -- An optional modrm,sib,disp complex
+   -- Some bytes of immediate data
+
+   The template gives you the breakdown of the instruction into those
+   bytes, and also tells you the type of modrm which is in use (read,
+   write, no-access, etc.)
+
+   Prefixes should really be divided into legacy and REX blocks, where
+   there is at most one REX prefix, but we don't bother.
+*/
+struct instr_template {
+	int bytes_prefix;
+	int bytes_opcode;
+	int bytes_modrm; /* includes SIB and displacement, if present */
+	int bytes_immediate;
+	int modrm_access_type;
+};
+
+static unsigned
+instr_size(const struct instr_template *it)
+{
+	return it->bytes_prefix + it->bytes_opcode + it->bytes_modrm + it->bytes_immediate;
+}
+
 static unsigned long
 fetch_ulong(struct process *proc, unsigned long addr)
 {
@@ -87,6 +115,35 @@ fetch_byte(struct process *proc, unsigned long addr)
 	addr -= byte_idx;
 	u.buf = fetch_ulong(proc, addr);
 	return u.bytes[byte_idx];
+}
+
+/* Underscore because you need to think about the return value */
+static int
+_fetch_bytes(struct process *proc, unsigned long addr, void *buf, size_t buf_size)
+{
+	/* We fetch a super-range of the desired [addr,
+	   addr+buf_size), so as to get proper alignment, and then
+	   memcpy to the output buffer. */
+	unsigned long *aligned_buf;
+	unsigned long real_start = addr;
+	unsigned long real_end = addr+buf_size;
+	unsigned long align_start = addr & ~7ul;
+	unsigned long align_end = (real_end + 7) & ~7ul;
+	unsigned long cursor;
+
+	aligned_buf = alloca(align_end - align_start);
+	errno = 0;
+	for (cursor = align_start; cursor != align_end; cursor += 8) {
+		aligned_buf[(cursor - align_start)/8] =
+			ptrace(PTRACE_PEEKDATA, proc->pid, cursor);
+		if (errno != 0) {
+			/* Failed */
+			free(aligned_buf);
+			return -1;
+		}
+	}
+	memcpy(buf, (void *)aligned_buf + real_start - align_start, buf_size);
+	return 0;
 }
 
 static void
@@ -340,88 +397,32 @@ add_mem_access_instr(struct loaded_object *lo, unsigned long addr)
 #define ACCESS_RW 3
 #define ACCESS_NONE 4
 
-static unsigned
+static void
 modrm(const unsigned char *instr,
-      unsigned bytes_prefix,
-      unsigned bytes_opcode,
-      unsigned bytes_immediate,
-      const void *mapped_at,
+      struct instr_template *it,
+      unsigned long mapped_at,
       struct loaded_object *lo,
-      unsigned prefixes,
-      unsigned access)
+      unsigned prefixes)
 {
-	unsigned char modrm = instr[bytes_prefix + bytes_opcode];
+	unsigned char modrm = instr[it->bytes_prefix + it->bytes_opcode];
 	unsigned rm = modrm & 7;
 	unsigned mod = modrm >> 6;
-	unsigned char sib;
-	unsigned char base;
-	unsigned char index;
-	unsigned char scale;
-	int have_sib = 0;
-	unsigned disp = 0;
-	int riprel = 0;
-	int interesting = access != ACCESS_NONE;
+	int interesting = it->modrm_access_type != ACCESS_NONE;
 
 	if (mod == 3) {
 		/* Register -> not interesting */
 		interesting = 0;
-	} else {
-		if (rm == 4) {
-			have_sib = 1;
-			sib = instr[bytes_prefix + bytes_opcode + 1];
-			base = sib & 7;
-			index = (sib >> 3) & 7;
-			scale = sib >> 6;
-
-			if (!(prefixes & (1 << PFX_REX_B)) &&
-			    base == 4) {
-				/* Stack access -> not interesting */
-				interesting = 0;
-			}
-			if (base == 5) {
-				if (mod == 1)
-					disp = 1;
-				else
-					disp = 4;
-			}
-		}
-
-		if (mod == 0 && rm == 5) {
-			disp = 4;
-			riprel = 1;
-		} else if (mod == 1) {
-			disp = 1;
-		} else if (mod == 2) {
-			disp = 4;
+	} else if (rm == 4 && !(prefixes & (1 << PFX_REX_B))) {
+		unsigned base = instr[it->bytes_prefix + it->bytes_opcode + 1] & 7;
+		if (base == 4) {
+			/* Stack access -> not interesting */
+			interesting = 0;
 		}
 	}
 
 	if (interesting)
-		add_mem_access_instr(lo, (unsigned long)mapped_at);
-
-	return 1 + have_sib + disp + bytes_prefix + bytes_opcode + bytes_immediate;
+		add_mem_access_instr(lo, mapped_at);
 }
-
-/* An x86 instruction consists of
-
-   -- Some prefixes
-   -- One or two bytes of opcode
-   -- An optional modrm,sib,disp complex
-   -- Some bytes of immediate data
-
-   The template gives you the breakdown of the instruction into those
-   bytes, and also tells you the type of modrm which is in use (read,
-   write, no-access, etc.)
-
-   Prefixes should really be divided into legacy and REX blocks, where
-   there is at most one REX prefix, but we don't bother.
-*/
-struct instr_template {
-	int bytes_prefix;
-	int bytes_opcode;
-	int bytes_immediate;
-	int modrm_access_type;
-};
 
 static void
 find_instr_template(const unsigned char *instr,
@@ -598,34 +599,200 @@ done_prefixes:
 		errx(1, "Can't handle instruction byte %02x at %p", instr[it->bytes_prefix],
 		     instr);
 	}
+
+	/* If we have a modrm, figure out how big it is. */
+	if (it->modrm_access_type != ACCESS_INVALID) {
+		unsigned char modrm = instr[it->bytes_prefix + it->bytes_opcode];
+		unsigned rm = modrm & 7;
+		unsigned mod = modrm >> 6;
+
+		it->bytes_modrm = 1;
+		if (mod == 3) {
+			/* Register encoding -> no SIB or displacement */
+		} else {
+			if (rm == 4) {
+				/* SIB */
+				it->bytes_modrm++;
+				if (mod == 0 &&
+				    (instr[it->bytes_prefix + it->bytes_opcode + 1] & 7) == 5) {
+					/* disp32 */
+					it->bytes_modrm += 4;
+				}
+			}
+			if (mod == 1) {
+				/* disp8 */
+				it->bytes_modrm++;
+			} else if (mod == 2) {
+				/* disp32 */
+				it->bytes_modrm += 4;
+			} else if (rm == 5) {
+				assert(mod == 0);
+				/* RIP relative 32 bit */
+				it->bytes_modrm += 4;
+			}
+		}
+	}
 }
 
 static unsigned
 handle_instruction(const unsigned char *base,
 		   const unsigned char *instr,
-		   const void *mapped_at,
+		   unsigned long mapped_at,
 		   struct loaded_object *lo)
 {
 	unsigned prefixes;
 	struct instr_template it;
-
 	find_instr_template(instr, &it, &prefixes);
+	if (it.modrm_access_type != ACCESS_INVALID)
+		modrm(instr, &it, mapped_at, lo, prefixes);
+	return instr_size(&it);
+}
 
-	if (it.modrm_access_type == ACCESS_INVALID)
-		return it.bytes_prefix + it.bytes_opcode + it.bytes_immediate;
-	return modrm(instr, it.bytes_prefix, it.bytes_opcode, it.bytes_immediate, mapped_at, lo, prefixes, it.modrm_access_type);
+static unsigned long
+fetch_reg_by_index(const struct user_regs_struct *urs, unsigned index)
+{
+#define c(i, n) case i: return urs-> n
+	switch (index) {
+		c(0, rax);
+		c(1, rcx);
+		c(2, rdx);
+		c(3, rbx);
+		c(4, rsp);
+		c(5, rbp);
+		c(6, rsi);
+		c(7, rdi);
+#define c2(i) c(i, r ## i)
+		c2(8);
+		c2(9);
+		c2(10);
+		c2(11);
+		c2(12);
+		c2(13);
+		c2(14);
+		c2(15);
+#undef c2
+#undef c
+	default:
+		fprintf(stderr, "bad register index %d\n", index);
+		abort();
+	}
+}
+
+static unsigned long
+eval_modrm_addr(const unsigned char *modrm_bytes,
+		const struct instr_template *it,
+		unsigned prefixes,
+		const struct user_regs_struct *urs)
+{
+	unsigned modrm = modrm_bytes[0];
+	unsigned rm = modrm & 7;
+	unsigned mod = modrm >> 6;
+	const unsigned char *disp_bytes;
+	unsigned long reg;
+
+	assert(mod != 3);
+	if (rm == 4) {
+		/* SIB */
+		unsigned sib;
+		unsigned base;
+		unsigned index;
+		unsigned scale;
+		unsigned long sibval;
+
+		disp_bytes = modrm_bytes + 2;
+
+		sib = modrm_bytes[1];
+		base = sib & 7;
+		index = (sib >> 3) & 7;
+		scale = 1 << (sib >> 6);
+
+		if (prefixes & (1 << PFX_REX_B))
+			base |= 8;
+		if (base == 5 || base == 13) {
+			if (mod == 0) {
+				sibval = (long)*(int *)disp_bytes;
+			} else if (mod == 1) {
+				sibval = fetch_reg_by_index(urs, base) +
+					*(char *)disp_bytes;
+			} else {
+				sibval = fetch_reg_by_index(urs, base) +
+					*(int *)disp_bytes;
+			}
+		} else {
+			sibval = fetch_reg_by_index(urs, base);
+		}
+		if (prefixes & (1 << PFX_REX_X))
+			index |= 8;
+		if (index != 4)
+			sibval += fetch_reg_by_index(urs, index) * scale;
+
+		return sibval;
+	}
+
+	disp_bytes = modrm_bytes + 1;
+
+	reg = fetch_reg_by_index(
+		urs,
+		rm | (prefixes & (1 << PFX_REX_B) ? 8 : 0));
+
+	switch (mod) {
+	case 0:
+		if (rm == 5)
+			return urs->rip + instr_size(it) + *(int *)disp_bytes;
+		else
+			return reg;
+	case 1:
+		return reg + *(char *)disp_bytes;
+	case 2:
+		return reg + *(int *)disp_bytes;
+	}
+	abort();
 }
 
 static void
 memory_access_breakpoint(struct process *p, struct breakpoint *bp, void *ctxt,
 			 struct user_regs_struct *urs)
 {
-	printf("Memory access at %lx\n", urs->rip);
+	unsigned char instr[16];
+	unsigned prefixes;
+	struct instr_template it;
+	unsigned long modrm_addr;
 
+	/* Set to contain a bunch of nops... */
+	memset(instr, 0x90, sizeof(instr));
+	/* Then grab as much of the actual isntruction as possible,
+	 * unless we get a page fault.  Should really do something
+	 * more clever if the first half of the instruction is
+	 * accessible but the second half isn't, but I don't really
+	 * care that much.  The worst case is that we set some watch
+	 * points in some stupid places soem small fraction of a
+	 * second before the program crashes. */
+	(void)_fetch_bytes(p, urs->rip, instr, sizeof(instr));
+
+	/* Make the decoder see the program's original memory content,
+	   rather than our breakpoint instruction. */
+	instr[0] = bp->old_content;
+
+	/* Find out what memory location it's accessing. */
+	find_instr_template(instr, &it, &prefixes);
+	assert(it.modrm_access_type != ACCESS_INVALID &&
+	       it.modrm_access_type != ACCESS_NONE);
+	modrm_addr = eval_modrm_addr(instr + it.bytes_prefix + it.bytes_opcode,
+				     &it,
+				     prefixes,
+				     urs);
+
+	printf("%lx: Access %lx %c%c\n",
+	       urs->rip,
+	       modrm_addr,
+	       it.modrm_access_type & ACCESS_R ? 'r' : '.',
+	       it.modrm_access_type & ACCESS_W ? 'w' : '.');
+
+	/* We're done, so disable this breakpoint */
 	unset_breakpoint(p, bp);
-
 	if (ptrace(PTRACE_SETREGS, p->pid, NULL, urs) < 0)
 		err(1, "PTRACE_SETREGS");
+	/* XXX set another one at random */
 }
 
 static void
@@ -722,7 +889,7 @@ process_shlib(struct process *p, unsigned long start_vaddr,
 			current_instr += handle_instruction(
 				(const unsigned char *)hdr,
 				current_instr,
-				(void *)start_vaddr + ((unsigned long)current_instr - (unsigned long)hdr),
+				start_vaddr + ((unsigned long)current_instr - (unsigned long)hdr),
 				lo);
 		}
 	}
