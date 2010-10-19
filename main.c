@@ -22,9 +22,16 @@
 #include <unistd.h>
 
 #define PRELOAD_LIB_NAME "./ndc.so"
+#define PTRACE_OPTIONS \
+	(PTRACE_O_TRACEFORK |			\
+	 PTRACE_O_TRACEVFORK |			\
+	 PTRACE_O_TRACECLONE |			\
+	 PTRACE_O_TRACEEXEC |			\
+	 PTRACE_O_TRACEVFORKDONE)
 
 struct process;
 struct loaded_object;
+struct thread;
 
 struct breakpoint {
 	struct breakpoint *next;
@@ -37,7 +44,7 @@ struct breakpoint {
 
 	unsigned long addr;
 	unsigned char old_content;
-	void (*f)(struct process *, struct breakpoint *, void *ctxt,
+	void (*f)(struct thread *, struct breakpoint *, void *ctxt,
 		  struct user_regs_struct *urs);
 	void *ctxt;
 };
@@ -54,12 +61,19 @@ struct loaded_object {
 	unsigned long *instrs;
 };
 
-struct process {
+struct thread {
+	struct thread *next, *prev;
+	struct process *process;
 	pid_t pid;
+	bool running;
+};
+
+struct process {
+	struct thread *head_thread;
 	int from_child_fd;
 	int to_child_fd;
 	unsigned long linker_brk_addr;
-	bool running;
+	int nr_threads;
 	struct breakpoint *head_breakpoint;
 	struct loaded_object *head_loaded_object;
 };
@@ -93,18 +107,18 @@ instr_size(const struct instr_template *it)
 }
 
 static unsigned long
-fetch_ulong(struct process *proc, unsigned long addr)
+fetch_ulong(struct thread *thr, unsigned long addr)
 {
 	unsigned long buf;
 	errno = 0;
-	buf = ptrace(PTRACE_PEEKDATA, proc->pid, addr);
+	buf = ptrace(PTRACE_PEEKDATA, thr->pid, addr);
 	if (errno != 0)
 		err(1, "peek(%lx)", addr);
 	return buf;
 }
 
 static unsigned char
-fetch_byte(struct process *proc, unsigned long addr)
+fetch_byte(struct thread *thr, unsigned long addr)
 {
 	unsigned byte_idx;
 	union {
@@ -113,13 +127,13 @@ fetch_byte(struct process *proc, unsigned long addr)
 	} u;
 	byte_idx = addr % 8;
 	addr -= byte_idx;
-	u.buf = fetch_ulong(proc, addr);
+	u.buf = fetch_ulong(thr, addr);
 	return u.bytes[byte_idx];
 }
 
 /* Underscore because you need to think about the return value */
 static int
-_fetch_bytes(struct process *proc, unsigned long addr, void *buf, size_t buf_size)
+_fetch_bytes(struct thread *thr, unsigned long addr, void *buf, size_t buf_size)
 {
 	/* We fetch a super-range of the desired [addr,
 	   addr+buf_size), so as to get proper alignment, and then
@@ -135,7 +149,7 @@ _fetch_bytes(struct process *proc, unsigned long addr, void *buf, size_t buf_siz
 	errno = 0;
 	for (cursor = align_start; cursor != align_end; cursor += 8) {
 		aligned_buf[(cursor - align_start)/8] =
-			ptrace(PTRACE_PEEKDATA, proc->pid, cursor);
+			ptrace(PTRACE_PEEKDATA, thr->pid, cursor);
 		if (errno != 0) {
 			/* Failed */
 			free(aligned_buf);
@@ -147,14 +161,14 @@ _fetch_bytes(struct process *proc, unsigned long addr, void *buf, size_t buf_siz
 }
 
 static void
-store_ulong(struct process *proc, unsigned long addr, unsigned long ulong)
+store_ulong(struct thread *thr, unsigned long addr, unsigned long ulong)
 {
-	if (ptrace(PTRACE_POKEDATA, proc->pid, addr, ulong) < 0)
+	if (ptrace(PTRACE_POKEDATA, thr->pid, addr, ulong) < 0)
 		err(1, "poke(%lx, %lx)", addr, ulong);
 }
 
 static void
-store_byte(struct process *proc, unsigned long addr, unsigned char byte)
+store_byte(struct thread *thr, unsigned long addr, unsigned char byte)
 {
 	unsigned byte_idx;
 	union {
@@ -163,15 +177,16 @@ store_byte(struct process *proc, unsigned long addr, unsigned char byte)
 	} u;
 	byte_idx = addr % 8;
 	addr -= byte_idx;
-	u.buf = fetch_ulong(proc, addr);
+	u.buf = fetch_ulong(thr, addr);
 	u.bytes[byte_idx] = byte;
-	store_ulong(proc, addr, u.buf);
+	store_ulong(thr, addr, u.buf);
 }
 
 static struct breakpoint *
-set_breakpoint(struct process *proc, unsigned long addr,
+set_breakpoint(struct thread *thr,
+	       unsigned long addr,
 	       struct loaded_object *lo,
-	       void (*f)(struct process *, struct breakpoint *, void *ctxt,
+	       void (*f)(struct thread *, struct breakpoint *, void *ctxt,
 			 struct user_regs_struct *urs),
 	       void *ctxt)
 {
@@ -180,28 +195,28 @@ set_breakpoint(struct process *proc, unsigned long addr,
 	bp->addr = addr;
 	bp->f = f;
 	bp->ctxt = ctxt;
-	bp->next = proc->head_breakpoint;
 	bp->lo = lo;
-	if (proc->head_breakpoint)
-		proc->head_breakpoint->prev = bp;
-	proc->head_breakpoint = bp;
+	bp->next = thr->process->head_breakpoint;
+	if (thr->process->head_breakpoint)
+		thr->process->head_breakpoint->prev = bp;
+	thr->process->head_breakpoint = bp;
 
-	bp->old_content = fetch_byte(proc, addr);
-	store_byte(proc, addr, 0xcc);
+	bp->old_content = fetch_byte(thr, addr);
+	store_byte(thr, addr, 0xcc);
 
 	return bp;
 }
 
 static void
-unset_breakpoint(struct process *proc, struct breakpoint *bp)
+unset_breakpoint(struct thread *thr, struct breakpoint *bp)
 {
-	store_byte(proc, bp->addr, bp->old_content);
+	store_byte(thr, bp->addr, bp->old_content);
 	if (bp->next)
 		bp->next->prev = bp->prev;
 	if (bp->prev)
 		bp->prev->next = bp->next;
 	else
-		proc->head_breakpoint = bp->next;
+		thr->process->head_breakpoint = bp->next;
 
 	if (bp->lo) {
 		if (bp == bp->lo->head_bp) {
@@ -218,18 +233,18 @@ unset_breakpoint(struct process *proc, struct breakpoint *bp)
 }
 
 static void
-pause_child(struct process *proc)
+pause_child(struct thread *thr)
 {
 	int status;
 
-	if (!proc->running)
+	if (!thr->running)
 		return;
-	if (kill(proc->pid, SIGSTOP) < 0)
+	if (kill(thr->pid, SIGSTOP) < 0)
 		err(1, "kill(SIGSTOP)");
-	if (waitpid(proc->pid, &status, WUNTRACED) < 0)
+	if (waitpid(thr->pid, &status, WUNTRACED|__WALL) < 0)
 		err(1, "waitpid() after sending SIGSTOP");
 	if (WIFSTOPPED(status)) {
-		proc->running = false;
+		thr->running = false;
 		return;
 	}
 
@@ -237,37 +252,37 @@ pause_child(struct process *proc)
 }
 
 static void
-resume_child(struct process *proc)
+resume_child(struct thread *thr)
 {
-	if (proc->running)
+	if (thr->running)
 		return;
-	if (ptrace(PTRACE_CONT, proc->pid, NULL, NULL) < 0)
+	if (ptrace(PTRACE_CONT, thr->pid, NULL, NULL) < 0)
 		err(1, "ptrace(PTRACE_CONT) from resume_child()");
-	proc->running = 1;
+	thr->running = 1;
 }
 
 static void
-handle_breakpoint(struct process *child)
+handle_breakpoint(struct thread *thr)
 {
 	struct user_regs_struct urs;
 	struct breakpoint *bp;
 
-	child->running = false;
-	if (ptrace(PTRACE_GETREGS, child->pid, NULL, &urs) < 0)
+	thr->running = false;
+	if (ptrace(PTRACE_GETREGS, thr->pid, NULL, &urs) < 0)
 		err(1, "PTRACE_GETREGS()");
 	urs.rip -= 1;
-	for (bp = child->head_breakpoint; bp; bp = bp->next) {
+	for (bp = thr->process->head_breakpoint; bp; bp = bp->next) {
 		if (bp->addr == urs.rip) {
-			bp->f(child, bp, bp->ctxt, &urs);
-			resume_child(child);
+			bp->f(thr, bp, bp->ctxt, &urs);
+			resume_child(thr);
 			return;
 		}
 	}
 
 	printf("... not one of our breakpoints at %lx...\n", urs.rip);
-	if (ptrace(PTRACE_CONT, child->pid, NULL, SIGTRAP) < 0)
+	if (ptrace(PTRACE_CONT, thr->pid, NULL, SIGTRAP) < 0)
 		err(1, "PTRACE_CONT() to delivert SIGTRAP");
-	child->running = true;
+	thr->running = true;
 }
 
 /* Invoked as an on_exit handler to do any necessary final cleanup */
@@ -275,8 +290,10 @@ static void
 kill_child(int ign, void *_child)
 {
 	struct process *child = _child;
-	if (child->pid != 0)
-		kill(child->pid, SIGKILL);
+	while (child->head_thread) {
+		kill(child->head_thread->pid, SIGKILL);
+		child->head_thread = child->head_thread->next;
+	}
 }
 
 static void my_setenv(const char *name, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
@@ -296,17 +313,22 @@ static struct process *
 spawn_child(const char *path, char *const argv[])
 {
 	struct process *work;
+	struct thread *thr;
 	int p1[2], p2[2];
 	pid_t c2;
 	int status;
 
 	work = calloc(sizeof(*work), 1);
+	thr = calloc(sizeof(*thr), 1);
+	work->head_thread = thr;
+	work->nr_threads = 1;
+	thr->process = work;
 	if (pipe(p1) < 0 || pipe(p2) < 0)
 		err(1, "pipe()");
-	work->pid = fork();
-	if (work->pid < 0)
+	thr->pid = fork();
+	if (thr->pid < 0)
 		err(1, "fork()");
-	if (work->pid == 0) {
+	if (thr->pid == 0) {
 		/* We are the child */
 		char *ld_preload;
 
@@ -338,7 +360,7 @@ spawn_child(const char *path, char *const argv[])
 
 	on_exit(kill_child, work);
 
-	c2 = waitpid(work->pid, &status, 0);
+	c2 = waitpid(thr->pid, &status, __WALL);
 	if (c2 < 0)
 		err(1, "waitpid()");
 	if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP)
@@ -346,16 +368,12 @@ spawn_child(const char *path, char *const argv[])
 
 	/* Turn on basically all the options except TRACESYSGOOD */
 	if (ptrace(PTRACE_SETOPTIONS,
-		   work->pid,
+		   thr->pid,
 		   NULL,
-		   PTRACE_O_TRACEFORK |
-		   PTRACE_O_TRACEVFORK |
-		   PTRACE_O_TRACECLONE |
-		   PTRACE_O_TRACEEXEC |
-		   PTRACE_O_TRACEVFORKDONE) < 0)
+		   PTRACE_OPTIONS) < 0)
 		err(1, "ptrace(PTRACE_SETOPTIONS)");
 
-	work->running = false;
+	thr->running = false;
 
 	return work;
 }
@@ -750,7 +768,7 @@ eval_modrm_addr(const unsigned char *modrm_bytes,
 }
 
 static void
-memory_access_breakpoint(struct process *p, struct breakpoint *bp, void *ctxt,
+memory_access_breakpoint(struct thread *p, struct breakpoint *bp, void *ctxt,
 			 struct user_regs_struct *urs)
 {
 	unsigned char instr[16];
@@ -796,7 +814,7 @@ memory_access_breakpoint(struct process *p, struct breakpoint *bp, void *ctxt,
 }
 
 static void
-install_breakpoints(struct process *p, struct loaded_object *lo)
+install_breakpoints(struct thread *thr, struct loaded_object *lo)
 {
 	/* For now, breakpoint on every memory access */
 	unsigned nr_breakpoints = lo->nr_instrs;
@@ -804,7 +822,7 @@ install_breakpoints(struct process *p, struct loaded_object *lo)
 	struct breakpoint *bp;
 
 	for (x = 0; x < nr_breakpoints; x++) {
-		bp = set_breakpoint(p, lo->instrs[x], lo, memory_access_breakpoint, lo);
+		bp = set_breakpoint(thr, lo->instrs[x], lo, memory_access_breakpoint, lo);
 		bp->next_lo = lo->head_bp;
 		lo->head_bp = bp;
 	}
@@ -894,7 +912,7 @@ process_shlib(struct process *p, unsigned long start_vaddr,
 		}
 	}
 
-	install_breakpoints(p, lo);
+	install_breakpoints(p->head_thread, lo);
 
 	munmap((void *)hdr, s);
 }
@@ -903,22 +921,24 @@ static bool
 shlib_interesting(char *fname)
 {
 	char *f = basename(fname);
-	return strcmp(f, "test_dlopen") == 0;
+	return strcmp(f, "test_race1") == 0;
 }
 
 static void
-unloaded_object(struct process *p, struct loaded_object *lo)
+unloaded_object(struct thread *thr, struct loaded_object *lo)
 {
 	printf("Unloaded %s\n", lo->name);
+
 	while (lo->head_bp)
-		unset_breakpoint(p, lo->head_bp);
+		unset_breakpoint(thr, lo->head_bp);
+
 	if (lo->next)
 		lo->next->prev = lo->prev;
 	if (lo->prev) {
 		lo->prev->next = lo->next;
 	} else {
-		assert(p->head_loaded_object == lo);
-		p->head_loaded_object = lo->next;
+		assert(thr->process->head_loaded_object == lo);
+		thr->process->head_loaded_object = lo->next;
 	}
 	free(lo->name);
 	free(lo->instrs);
@@ -926,17 +946,20 @@ unloaded_object(struct process *p, struct loaded_object *lo)
 }
 
 static void
-linker_did_something(struct process *p, struct breakpoint *bp, void *ctxt,
-		     struct user_regs_struct *urs)
+linker_did_something(struct thread *thr, struct breakpoint *_ign1, void *_ign2,
+		     struct user_regs_struct *_ign3)
 {
 	FILE *f;
 	char *path;
 	struct loaded_object *lo;
+	struct process *p = thr->process;
+
+	printf("Linker did something.\n");
 
 	for (lo = p->head_loaded_object; lo; lo = lo->next)
 		lo->live = false;
 
-	asprintf(&path, "/proc/%d/maps", p->pid);
+	asprintf(&path, "/proc/%d/maps", thr->pid);
 	f = fopen(path, "r");
 	if (!f)
 		err(1, "fopen(%s, \"r\")", path);
@@ -990,7 +1013,7 @@ linker_did_something(struct process *p, struct breakpoint *bp, void *ctxt,
 	while (p->head_loaded_object &&
 	       !p->head_loaded_object->live) {
 		struct loaded_object *next = p->head_loaded_object->next;
-		unloaded_object(p, p->head_loaded_object);
+		unloaded_object(thr, p->head_loaded_object);
 		p->head_loaded_object = next;
 	}
 	if (p->head_loaded_object) {
@@ -1000,7 +1023,7 @@ linker_did_something(struct process *p, struct breakpoint *bp, void *ctxt,
 		     lo = next) {
 			if (!lo->next->live) {
 				next = lo->next->next;
-				unloaded_object(p, lo->next);
+				unloaded_object(thr, lo->next);
 				lo->next = next;
 				next = lo;
 			} else {
@@ -1012,16 +1035,82 @@ linker_did_something(struct process *p, struct breakpoint *bp, void *ctxt,
 	fclose(f);
 }
 
+static void
+handle_clone(struct thread *parent)
+{
+	unsigned long new_pid;
+	struct thread *thr;
+	int status;
+
+	if (ptrace(PTRACE_GETEVENTMSG, parent->pid, NULL, &new_pid) < 0)
+		err(1, "PTRACE_GETEVENTMSG() for clone");
+	printf("New pid %ld\n", new_pid);
+	thr = calloc(sizeof(*thr), 1);
+	thr->pid = new_pid;
+	thr->running = false;
+	thr->process = parent->process;
+
+	if (waitpid(thr->pid, &status, __WALL) < 0)
+		err(1, "waitpid() for new thread %d", thr->pid);
+
+	if (!WIFSTOPPED(status)) {
+		fprintf(stderr, "unexpected waitpid status %d for clone\n", status);
+		abort();
+	}
+
+	/* Set up the normal options */
+	if (ptrace(PTRACE_SETOPTIONS, thr->pid, NULL, PTRACE_OPTIONS) < 0)
+		err(1, "ptrace(PTRACE_SETOPTIONS) for new thread");
+
+	/* Enlist the new thread in the process */
+	thr->next = parent->process->head_thread;
+	if (parent->process->head_thread)
+		parent->process->head_thread->prev = thr;
+	parent->process->head_thread = thr;
+	parent->process->nr_threads++;
+
+	/* And let them both go */
+	resume_child(thr);
+	resume_child(parent);
+}
+
+static struct thread *
+find_thread_by_pid(struct process *p, pid_t pid)
+{
+	struct thread *thr;
+	for (thr = p->head_thread; thr && thr->pid != pid; thr = thr->next)
+		;
+	return thr;
+}
+
+static void
+thread_exited(struct thread *thr, int status)
+{
+	printf("Thread %d exited\n", thr->pid);
+	if (thr->next)
+		thr->next->prev = thr->prev;
+	if (thr->prev)
+		thr->prev->next = thr->next;
+	else
+		thr->process->head_thread = thr->next;
+	thr->process->nr_threads--;
+	if (thr->process->nr_threads == 0)
+		exit(status);
+	free(thr);
+}
+
 int
 main(int argc, char *argv[], char *environ[])
 {
 	struct process *child;
+	struct thread *thr;
 	int r;
 
 	child = spawn_child(argv[1], argv + 1);
 
 	/* Child starts stopped. */
-	resume_child(child);
+	assert(child->nr_threads == 1);
+	resume_child(child->head_thread);
 
 	/* Get the break address */
 	r = read(child->from_child_fd, &child->linker_brk_addr,
@@ -1029,10 +1118,11 @@ main(int argc, char *argv[], char *environ[])
 	if (r != sizeof(child->linker_brk_addr))
 		err(1, "reading child's linker break address");
 	printf("Child break %lx\n", child->linker_brk_addr);
-	pause_child(child);
-	set_breakpoint(child, child->linker_brk_addr, NULL,
+	pause_child(child->head_thread);
+	set_breakpoint(child->head_thread, child->linker_brk_addr, NULL,
 		       linker_did_something, NULL);
-	resume_child(child);
+	linker_did_something(child->head_thread, NULL, NULL, NULL);
+	resume_child(child->head_thread);
 
 	/* Close out our file descriptors to set it going properly. */
 	close(child->from_child_fd);
@@ -1040,28 +1130,35 @@ main(int argc, char *argv[], char *environ[])
 
 	while (1) {
 		pid_t c;
-		siginfo_t si;
+		int status;
 
-		resume_child(child);
-		c = waitid(P_ALL, 0, &si, WEXITED|WSTOPPED);
+		c = waitpid(-1, &status, __WALL);
 		if (c < 0)
 			err(1, "waitid()");
-		assert(si.si_pid == child->pid);
+		thr = find_thread_by_pid(child, c);
+		if (!thr) {
+			/* This can sometimes happen if the child
+			   clone()s itself and we find about the new
+			   child before we get the EVENT_CLONE
+			   message.  Just ignore it. */
+			printf("Unknown child %d stopped.\n", c);
+			continue;
+		}
 
-		if (si.si_code == CLD_EXITED) {
+		thr->running = false;
+
+		if (WIFEXITED(status)) {
 			printf("Child exited with status %d, doing the same thing\n",
-			       WEXITSTATUS(si.si_status));
-			child->pid = 0; /* Keep the on_exit handler
-					 * from doing anything
-					 * stupid */
-			exit(si.si_status);
-		} else if (si.si_code == CLD_KILLED) {
-			printf("Child got signal %d\n", si.si_status);
-			if (si.si_status == SIGSTOP) {
+			       WEXITSTATUS(status));
+			thread_exited(thr, WEXITSTATUS(status));
+		} else if (WIFSIGNALED(status)) {
+			printf("Child got signal %d\n", WTERMSIG(status));
+			if (WTERMSIG(status)) {
 				/* We sometimes send the child
 				 * SIGSTOP.  Don't confuse ourselves
 				 * when we do so */
 				printf("... but we sent it, so it's okay\n");
+				abort();
 			} else {
 				/* Should arguably raise() the signal
 				   here, rather than exiting, so that
@@ -1072,10 +1169,21 @@ main(int argc, char *argv[], char *environ[])
 				   behind by the child. */
 				exit(1);
 			}
-		} else if (si.si_code == CLD_TRAPPED) {
-			handle_breakpoint(child);
+		} else if (WIFSTOPPED(status)) {
+			switch (status >> 16) {
+			case 0:
+				handle_breakpoint(thr);
+				break;
+			case PTRACE_EVENT_CLONE:
+				printf("Child spawned a new thread...\n");
+				handle_clone(thr);
+				break;
+			default:
+				fprintf(stderr, "unknown ptrace event %d\n", WSTOPSIG(status) >> 8);
+				abort();
+			}
 		} else {
-			printf("Code %d, status %x\n", si.si_code, si.si_status);
+			fprintf(stderr, "unexpected waitpid status %x\n", status);
 			abort();
 		}
 	}
