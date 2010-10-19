@@ -101,6 +101,10 @@ struct process {
 	unsigned long linker_brk_addr;
 	int nr_threads;
 	int tgid;
+
+	pid_t timeout_pid;
+	bool timeout_fired;
+
 	struct breakpoint *head_breakpoint;
 	struct loaded_object *head_loaded_object;
 
@@ -319,7 +323,7 @@ push_pending_wait_status(struct pending_wait_status *pws, pid_t pid, int status)
 	pws->nr_pending++;
 }
 
-static void
+static bool
 receive_ptrace_event(struct process *proc)
 {
 	pid_t pid;
@@ -327,11 +331,19 @@ receive_ptrace_event(struct process *proc)
 	struct thread *thr;
 
 	if (check_pending_waits(proc))
-		return;
+		return true;
 
 	pid = waitpid(-1, &status, __WALL);
-	if (pid < 0)
+	if (pid < 0) {
+		if (errno == EINTR)
+			return false;
 		err(1, "waitpid()");
+	}
+
+	if (pid == proc->timeout_pid) {
+		proc->timeout_fired = true;
+		return false;
+	}
 
 	assert(status != -1);
 
@@ -342,17 +354,21 @@ receive_ptrace_event(struct process *proc)
 		printf("Push to pending\n");
 		push_pending_wait_status(&proc->pws, pid, status);
 	}
+
+	return true;
 }
 
-static void
+static bool
 pause_child(struct thread *thr)
 {
 	if (thr->stop_status != -1)
-		return;
+		return true;
 	if (tgkill(thr->process->tgid, thr->pid, SIGSTOP) < 0)
 		err(1, "kill(SIGSTOP)");
 	while (thr->stop_status == -1)
-		receive_ptrace_event(thr->process);
+		if (!receive_ptrace_event(thr->process))
+			return false;
+	return true;
 }
 
 static void
@@ -363,6 +379,13 @@ resume_child(struct thread *thr)
 	if (ptrace(PTRACE_CONT, thr->pid, NULL, NULL) < 0)
 		err(1, "ptrace(PTRACE_CONT) from resume_child()");
 	thr->stop_status = -1;
+}
+
+static void
+unpause_child(struct thread *thr)
+{
+	if (WIFSTOPPED(thr->stop_status) && WSTOPSIG(thr->stop_status) == SIGSTOP)
+		resume_child(thr);
 }
 
 /* Only need one at a time, so this is trivial. */
@@ -411,7 +434,7 @@ set_watchpoint(struct process *p, unsigned long addr, unsigned size, int watch_r
 			err(1, "Setting debug register 7 of %d", thr->pid);
 
 		if (running)
-			resume_child(thr);
+			unpause_child(thr);
 	}
 
 	return (struct watchpoint *)p;
@@ -435,7 +458,7 @@ unset_watchpoint(struct watchpoint *w)
 			   0) < 0)
 			err(1, "Clearing debug register 7 of %d", thr->pid);
 		if (running)
-			resume_child(thr);
+			unpause_child(thr);
 	}
 }
 
@@ -546,7 +569,8 @@ spawn_child(const char *path, char *const argv[])
 	on_exit(kill_child, work);
 
 	while (thr->stop_status == -1)
-		receive_ptrace_event(work);
+		if (!receive_ptrace_event(work))
+			abort();
 	if (!WIFSTOPPED(thr->stop_status) || WSTOPSIG(thr->stop_status) != SIGTRAP)
 		errx(1, "strange status %x from waitpid()", thr->stop_status);
 
@@ -1032,7 +1056,8 @@ memory_access_breakpoint(struct thread *p, struct breakpoint *bp, void *ctxt,
 	while (!timer_fired) {
 		struct thread *other;
 		bool nothing_running = true;
-		receive_ptrace_event(p->process);
+		if (!receive_ptrace_event(p->process))
+			continue;
 		for (other = p->process->head_thread;
 		     other;
 		     other = other->next) {
@@ -1408,8 +1433,41 @@ main(int argc, char *argv[], char *environ[])
 	close(child->from_child_fd);
 	close(child->to_child_fd);
 
+	/* wait() and friends don't have convenient timeout arguments,
+	   and doing it with signals is a pain, so just have a child
+	   process which sleeps 60 seconds and then exits. */
+	child->timeout_pid = fork();
+	if (child->timeout_pid == 0) {
+		sleep(5);
+		_exit(0);
+	}
+
 	while (1) {
 		struct thread *thr;
+
+		if (child->timeout_fired) {
+			int status;
+			struct loaded_object *lo;
+
+			printf("TIMEOUT\n");
+
+			child->timeout_fired = false;
+			child->timeout_pid = fork();
+			if (child->timeout_pid == 0) {
+				sleep(5);
+				_exit(0);
+			}
+
+			status = child->head_thread->stop_status;
+			if (status == -1)
+				pause_child(child->head_thread);
+
+			for (lo = child->head_loaded_object; lo; lo = lo->next)
+				install_breakpoints(child->head_thread, lo);
+
+			if (status == -1)
+				unpause_child(child->head_thread);
+		}
 
 		for (thr = child->head_thread; thr && thr->stop_status == -1; thr = thr->next)
 			;
