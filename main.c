@@ -872,6 +872,7 @@ done_prefixes:
 	case 0x63: /* mov Gv, Ed */
 	case 0x84: /* test Ev, Gv */
 	case 0x85: /* test Ev, Gv */
+	case 0x8a: /* mov Gb, Eb */
 	case 0x8b: /* mov Gv, Ev */
 	case 0xff: /* Group 5 Ev */
 		it->modrm_access_type = ACCESS_R;
@@ -1616,7 +1617,7 @@ main(int argc, char *argv[], char *environ[])
 				handle_clone(thr);
 				break;
 			default:
-				fprintf(stderr, "unknown ptrace event %d\n", WSTOPSIG(thr->stop_status) >> 8);
+				fprintf(stderr, "unknown ptrace event %d\n", thr->stop_status >> 16);
 				abort();
 			}
 		} else if (WIFSTOPPED(thr->stop_status) &&
