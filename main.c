@@ -41,6 +41,8 @@
 	 PTRACE_O_TRACEEXEC |			\
 	 PTRACE_O_TRACEVFORKDONE)
 
+static const char *target_binary;
+
 struct process;
 struct loaded_object;
 struct thread;
@@ -655,6 +657,7 @@ find_instr_template(const unsigned char *instr,
 		    unsigned *prefixes)
 {
 	unsigned opcode;
+	unsigned imm_opsize;
 
 	memset(it, 0, sizeof(*it));
 
@@ -717,6 +720,10 @@ done_prefixes:
 		it->bytes_prefix++;
 	}
 
+	imm_opsize = 4;
+	if (*prefixes & (1 << PFX_OPSIZE))
+		imm_opsize = 2;
+
 	it->bytes_opcode = 1;
 	opcode = instr[it->bytes_prefix];
 	if (opcode <= 0x37 && ((opcode & 7) <= 5)) {
@@ -733,7 +740,7 @@ done_prefixes:
 			it->bytes_immediate = 1;
 			break;
 		case 5: /* <op> al, Iz */
-			it->bytes_immediate = 4;
+			it->bytes_immediate = imm_opsize;
 			break;
 		}
 		goto done_decode;
@@ -752,6 +759,7 @@ done_prefixes:
 
 		case 0x10: /* movss Vss, Wss */
 
+		case 0x14:
 		case 0x28 ... 0x2a: /* Various XMM instructions */
 		case 0x2c ... 0x2f:
 		case 0x51 ... 0x5f:
@@ -764,9 +772,17 @@ done_prefixes:
 		case 0xbf: /* movsz Gb, Ew */
 			it->modrm_access_type = ACCESS_R;
 			break;
+
+		case 0x11:
 		case 0x90 ... 0x9f: /* setne */
 			it->modrm_access_type = ACCESS_W;
 			break;
+
+		case 0xc2:
+			it->modrm_access_type = ACCESS_R;
+			it->bytes_immediate = 1;
+			break;
+
 		default:
 			errx(1, "Can't handle instruction %02x %02x at %#lx\n",
 			     instr[it->bytes_prefix], instr[it->bytes_prefix+1],
@@ -777,12 +793,12 @@ done_prefixes:
 	case 0x3c: /* cmp al, Ib */
 	case 0x70 ... 0x7f: /* jcc Ib */
 	case 0xa8: /* test al, Ib */
+	case 0xb0 ... 0xb7: /* mov reg, Ib */
 	case 0xeb: /* jmp Ib */
 		it->bytes_immediate = 1;
 		break;
 
-	case 0xd1: /* group 2 Ev, 1 */
-	case 0xd3: /* group 2 Ev, Cl */
+	case 0xd0 ... 0xd3: /* group 2 E{bv}, {1,Cl} */
 		it->modrm_access_type = ACCESS_RW;
 		break;
 
@@ -813,7 +829,7 @@ done_prefixes:
 
 	case 0x69: /* imul Gv, Ev, Iz */
 		it->modrm_access_type = ACCESS_R;
-		it->bytes_immediate = 4;
+		it->bytes_immediate = imm_opsize;
 		break;
 
 	case 0x80: /* Group 1 Eb, Ib */
@@ -828,7 +844,7 @@ done_prefixes:
 		if (instr[it->bytes_prefix] == 0x80 || instr[it->bytes_prefix] == 0x83)
 			it->bytes_immediate = 1;
 		else
-			it->bytes_immediate = 4;
+			it->bytes_immediate = imm_opsize;
 		break;
 
 	case 0xc0: /* Group 2 Eb, Ib */
@@ -848,7 +864,7 @@ done_prefixes:
 		break;
 
 	case 0xc7: /* group 11 Ev, Iz */
-		it->bytes_immediate = 4;
+		it->bytes_immediate = imm_opsize;
 		it->modrm_access_type = ACCESS_W;
 		break;
 
@@ -876,6 +892,7 @@ done_prefixes:
 		      moderately hard-to-handle way, so just ignore
 		      it. */
 	case 0xab: /* stos */
+	case 0xa5: /* movs */
 		break;
 
 	case 0x3d: /* cmp rax, Iz */
@@ -883,7 +900,7 @@ done_prefixes:
 	case 0xa9: /* test rax, Iz */
 	case 0xe8: /* Call Jz */
 	case 0xe9: /* jmp Jz */
-		it->bytes_immediate = 4;
+		it->bytes_immediate = imm_opsize;
 		break;
 
 	case 0xb8 ... 0xbf: /* mov reg, Iz */
@@ -892,7 +909,7 @@ done_prefixes:
 		else if (*prefixes & (1 << PFX_OPSIZE))
 			it->bytes_immediate = 2;
 		else
-			it->bytes_immediate = 4;
+			it->bytes_immediate = imm_opsize;
 		break;
 
 	case 0xf6:
@@ -902,7 +919,7 @@ done_prefixes:
 		if (reg == 0 || reg == 1) {
 			/* test Ev, Iz */
 			if (opcode == 0xf7)
-				it->bytes_immediate = 4;
+				it->bytes_immediate = imm_opsize;
 			else
 				it->bytes_immediate = 1;
 		} else {
@@ -1312,7 +1329,7 @@ static bool
 shlib_interesting(char *fname)
 {
 	char *f = basename(fname);
-	return strcmp(f, "ls") == 0;
+	return strcmp(f, target_binary) == 0;
 }
 
 static void
@@ -1506,6 +1523,8 @@ main(int argc, char *argv[], char *environ[])
 	sigemptyset(&timer_sa.sa_mask);
 	if (sigaction(SIGALRM, &timer_sa, NULL) < 0)
 		err(1, "installing SIGALRM handler");
+
+	target_binary = basename(argv[1]);
 
 	child = spawn_child(argv[1], argv + 1);
 
