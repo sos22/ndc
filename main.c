@@ -650,9 +650,12 @@ modrm(const unsigned char *instr,
 
 static void
 find_instr_template(const unsigned char *instr,
+		    unsigned long addr,
 		    struct instr_template *it,
 		    unsigned *prefixes)
 {
+	unsigned opcode;
+
 	memset(it, 0, sizeof(*it));
 
 	it->modrm_access_type = ACCESS_INVALID;
@@ -701,7 +704,7 @@ find_instr_template(const unsigned char *instr,
 done_prefixes:
 	it->bytes_prefix--;
 
-	if (instr[it->bytes_prefix] >= 0x40 && instr[it->bytes_prefix] < 0x4f) {
+	if (instr[it->bytes_prefix] >= 0x40 && instr[it->bytes_prefix] <= 0x4f) {
 		*prefixes |= 1 << PFX_REX_0;
 		if (instr[it->bytes_prefix] & 1)
 			*prefixes |= 1 << PFX_REX_B;
@@ -715,41 +718,102 @@ done_prefixes:
 	}
 
 	it->bytes_opcode = 1;
-
-	switch (instr[it->bytes_prefix]) {
+	opcode = instr[it->bytes_prefix];
+	if (opcode <= 0x37 && ((opcode & 7) <= 5)) {
+		/* These are simple arithmetic operations.  Handle
+		 * them seperately */
+		switch (opcode & 7) {
+		case 0: case 1: /* <op> Ex, Gx */
+			it->modrm_access_type = ACCESS_RW;
+			break;
+		case 2: case 3: /* <op> Gx, Ex */
+			it->modrm_access_type = ACCESS_R;
+			break;
+		case 4: /* <op> al, Ib */
+			it->bytes_immediate = 1;
+			break;
+		case 5: /* <op> al, Iz */
+			it->bytes_immediate = 4;
+			break;
+		}
+		goto done_decode;
+	}
+	switch (opcode) {
 	case 0x0f: /* Escape to two-byte */
 		it->bytes_opcode = 2;
 		switch (instr[it->bytes_prefix + 1]) {
 		case 0x1f: /* nop */
 			it->modrm_access_type = ACCESS_NONE;
 			break;
+
 		case 0x80 ... 0x8f: /* jcc Jz */
 			it->bytes_immediate = 4;
 			break;
+
+		case 0x10: /* movss Vss, Wss */
+
+		case 0x28 ... 0x2a: /* Various XMM instructions */
+		case 0x2c ... 0x2f:
+		case 0x51 ... 0x5f:
+
+		case 0x40 ... 0x4f: /* cmovcc Gv, Ev */
+		case 0xaf: /* imul Gv, Ev */
 		case 0xb6: /* movz Gv, Eb */
 		case 0xb7: /* movz Gv, Ew */
+		case 0xbe: /* movsz Gb, Eb */
+		case 0xbf: /* movsz Gb, Ew */
 			it->modrm_access_type = ACCESS_R;
 			break;
 		case 0x90 ... 0x9f: /* setne */
 			it->modrm_access_type = ACCESS_W;
 			break;
 		default:
-			errx(1, "Can't handle instruction %02x %02x at %p\n",
+			errx(1, "Can't handle instruction %02x %02x at %#lx\n",
 			     instr[it->bytes_prefix], instr[it->bytes_prefix+1],
-			     instr);
+			     addr);
 		}
 		break;
 
 	case 0x3c: /* cmp al, Ib */
 	case 0x70 ... 0x7f: /* jcc Ib */
+	case 0xa8: /* test al, Ib */
 	case 0xeb: /* jmp Ib */
 		it->bytes_immediate = 1;
 		break;
 
-	case 0x01: /* add Ev, Gv */
-	case 0x29: /* sub Ev, Gv */
-	case 0x31: /* xor Ev, Gv */
+	case 0xd1: /* group 2 Ev, 1 */
+	case 0xd3: /* group 2 Ev, Cl */
 		it->modrm_access_type = ACCESS_RW;
+		break;
+
+	case 0xd8 ... 0xdf: /* x87 */ {
+		unsigned modrm = instr[it->bytes_prefix + 1];
+		if (modrm > 0xc0) {
+			/* This instruction doesn't access memory, but
+			   has a one-byte pseudo-modrm.  Treat it as
+			   part of the opcode. */
+			it->modrm_access_type = ACCESS_INVALID;
+			it->bytes_opcode = 2;
+		} else {
+			/* Access memory, need to be slightly more
+			 * careful */
+			unsigned reg = (modrm >> 3) & 7;
+			it->modrm_access_type = ACCESS_R;
+			if (opcode == 0xd9) {
+				if (reg == 2 || reg == 3 ||
+				    reg == 6 || reg == 7)
+					it->modrm_access_type = ACCESS_W;
+			} else if (opcode & 1) {
+				if (reg != 0 && reg != 5)
+					it->modrm_access_type = ACCESS_W;
+			}
+		}
+		break;
+	}
+
+	case 0x69: /* imul Gv, Ev, Iz */
+		it->modrm_access_type = ACCESS_R;
+		it->bytes_immediate = 4;
 		break;
 
 	case 0x80: /* Group 1 Eb, Ib */
@@ -788,7 +852,6 @@ done_prefixes:
 		it->modrm_access_type = ACCESS_W;
 		break;
 
-	case 0x03: /* add Gv, Ev */
 	case 0x38 ... 0x3b: /* Various forms of cmp */
 	case 0x63: /* mov Gv, Ed */
 	case 0x84: /* test Ev, Gv */
@@ -804,25 +867,58 @@ done_prefixes:
 
 	case 0x50 ... 0x5f: /* push and pop single register */
 	case 0x90: /* nop */
+	case 0x98: /* cltq */
 	case 0xc3: /* ret */
 	case 0xc9: /* leave */
 	case 0xf4: /* hlt */
+
+	case 0xa6: /* cmps.  This does access memory, but it's in a
+		      moderately hard-to-handle way, so just ignore
+		      it. */
+	case 0xab: /* stos */
 		break;
 
-	case 0x05: /* add rax, Iz */
-	case 0x25: /* and rax, Iz */
-	case 0x2d: /* sub rax, Iz */
+	case 0x3d: /* cmp rax, Iz */
 	case 0x68: /* push Iz */
-	case 0xb8 ... 0xbf: /* mov reg, Iz */
+	case 0xa9: /* test rax, Iz */
 	case 0xe8: /* Call Jz */
 	case 0xe9: /* jmp Jz */
 		it->bytes_immediate = 4;
 		break;
 
-	default:
-		errx(1, "Can't handle instruction byte %02x at %p", instr[it->bytes_prefix],
-		     instr);
+	case 0xb8 ... 0xbf: /* mov reg, Iz */
+		if (*prefixes & (1 << PFX_REX_W))
+			it->bytes_immediate = 8;
+		else if (*prefixes & (1 << PFX_OPSIZE))
+			it->bytes_immediate = 2;
+		else
+			it->bytes_immediate = 4;
+		break;
+
+	case 0xf6:
+	case 0xf7: /* group 3 */ {
+		unsigned modrm = instr[it->bytes_prefix+1];
+		unsigned reg = (modrm >> 3) & 7;
+		if (reg == 0 || reg == 1) {
+			/* test Ev, Iz */
+			if (opcode == 0xf7)
+				it->bytes_immediate = 4;
+			else
+				it->bytes_immediate = 1;
+		} else {
+			/* Other Ev */
+			it->bytes_immediate = 0;
+		}
+		it->modrm_access_type = ACCESS_R;
+		break;
 	}
+
+	default:
+		errx(1, "Can't handle instruction byte %02x at %#lx", instr[it->bytes_prefix],
+		     addr);
+	}
+
+done_decode:
 
 	/* If we have a modrm, figure out how big it is. */
 	if (it->modrm_access_type != ACCESS_INVALID) {
@@ -866,7 +962,7 @@ handle_instruction(const unsigned char *base,
 {
 	unsigned prefixes;
 	struct instr_template it;
-	find_instr_template(instr, &it, &prefixes);
+	find_instr_template(instr, mapped_at, &it, &prefixes);
 	if (it.modrm_access_type != ACCESS_INVALID)
 		modrm(instr, &it, mapped_at, lo, prefixes);
 	return instr_size(&it);
@@ -1027,7 +1123,7 @@ memory_access_breakpoint(struct thread *p, struct breakpoint *bp, void *ctxt,
 	(void)_fetch_bytes(p, urs->rip, instr, sizeof(instr));
 
 	/* Find out what memory location it's accessing. */
-	find_instr_template(instr, &it, &prefixes);
+	find_instr_template(instr, urs->rip, &it, &prefixes);
 	assert(it.modrm_access_type != ACCESS_INVALID &&
 	       it.modrm_access_type != ACCESS_NONE);
 	modrm_addr = eval_modrm_addr(instr + it.bytes_prefix + it.bytes_opcode,
@@ -1216,7 +1312,7 @@ static bool
 shlib_interesting(char *fname)
 {
 	char *f = basename(fname);
-	return strcmp(f, "test_race1") == 0;
+	return strcmp(f, "ls") == 0;
 }
 
 static void
