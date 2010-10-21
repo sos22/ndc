@@ -25,7 +25,7 @@
 
 /* We aim to have one in TARGET_BREAKPOINT_RATION possible breakpoints
    live at any one time */
-#define TARGET_BREAKPOINT_RATIO 1000
+#define TARGET_BREAKPOINT_RATIO 10000
 
 /* Every n seconds, clear all breakpoints and set a new batch. */
 #define RESET_BREAKPOINTS_TIMEOUT 120
@@ -805,7 +805,12 @@ done_prefixes:
 		case 0x14:
 		case 0x28 ... 0x2a: /* Various XMM instructions */
 		case 0x2c ... 0x2f:
-		case 0x51 ... 0x5f:
+		case 0x51 ... 0x6f:
+		case 0x74 ... 0x76:
+		case 0xd0 ... 0xd5:
+		case 0xd8 ... 0xdf:
+		case 0xe8 ... 0xef:
+		case 0xf8 ... 0xff:
 
 		case 0x40 ... 0x4f: /* cmovcc Gv, Ev */
 		case 0xaf: /* imul Gv, Ev */
@@ -824,6 +829,11 @@ done_prefixes:
 				it->modrm_access_type = ACCESS_R;
 			break;
 
+		case 0x71 ... 0x73: /* group 12 through 14 N,Ib or U, Ib */
+			it->bytes_immediate = 1;
+			it->modrm_access_type = ACCESS_NONE;
+			break;
+
 		case 0x7e: /* Movd with mode one of Ed/q, Pd/q; Vq, Wq; Ed/q, Vd/q */
 			if (*prefixes & (1 << PFX_REP))
 				it->modrm_access_type = ACCESS_R;
@@ -832,7 +842,9 @@ done_prefixes:
 			break;
 
 		case 0x11:
-		case 0x90 ... 0x9f: /* setne */
+		case 0x7f:
+		case 0x90 ... 0x9f: /* setcc */
+		case 0xe7: /* movnt M, V */
 			it->modrm_access_type = ACCESS_W;
 			break;
 
@@ -843,6 +855,10 @@ done_prefixes:
 		case 0xc2:
 			it->modrm_access_type = ACCESS_R;
 			it->bytes_immediate = 1;
+			break;
+
+		case 0x77: /* emms */
+		case 0xc8 ... 0xcf: /* bswap reg */
 			break;
 
 		default:
@@ -1182,9 +1198,6 @@ install_breakpoints(struct thread *thr, struct loaded_object *lo)
 
 	target_nr_breakpoints = lo->nr_instrs / TARGET_BREAKPOINT_RATIO;
 
-	printf("Have %d breakpoints, want %d\n", lo->nr_breakpoints,
-	       target_nr_breakpoints);
-
 	sanity_check_lo(lo);
 	while (lo->nr_breakpoints < target_nr_breakpoints) {
 		x = random() % lo->nr_instrs;
@@ -1214,8 +1227,6 @@ memory_access_breakpoint(struct thread *p, struct breakpoint *bp, void *ctxt,
 	unsigned long modrm_addr;
 	struct watchpoint *wp;
 	struct itimerval itimer;
-
-	printf("Breakpoint on %lx fired.\n", bp->addr);
 
 	assert(bp->lo);
 	sanity_check_lo(bp->lo);
@@ -1715,10 +1726,15 @@ main(int argc, char *argv[], char *environ[])
 			 * pause_thread().  Ignore. */
 			printf("...sigstop...\n");
 			resume_child(thr);
+		} else if (WIFSTOPPED(thr->stop_status)) {
+			printf("Child got signal %d, letting it go through.\n",
+			       WSTOPSIG(thr->stop_status));
+			if (ptrace(PTRACE_CONT, thr->pid, NULL,
+				   (unsigned long)WSTOPSIG(thr->stop_status)) < 0)
+				err(1, "forwarding signal to child with ptrace");
+			thr->stop_status = -1;
 		} else {
 			fprintf(stderr, "unexpected waitpid status %x\n", thr->stop_status);
-			if (WIFSTOPPED(thr->stop_status))
-				fprintf(stderr, "... stopped by %d\n", WSTOPSIG(thr->stop_status));
 			abort();
 		}
 	}
