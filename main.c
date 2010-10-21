@@ -25,14 +25,14 @@
 
 /* We aim to have one in TARGET_BREAKPOINT_RATION possible breakpoints
    live at any one time */
-#define TARGET_BREAKPOINT_RATIO 1000
+#define TARGET_BREAKPOINT_RATIO 10
 
 /* Every n seconds, clear all breakpoints and set a new batch. */
-#define RESET_BREAKPOINTS_TIMEOUT 10
+#define RESET_BREAKPOINTS_TIMEOUT 120
 
 /* How long to wiat for after we've hit a breakpoint.  In seconds, as
  * a double. */
-#define DELAY_WHEN_BREAKPOINT_HIT 0.1
+#define DELAY_WHEN_BREAKPOINT_HIT 0.01
 
 #define offsetof(field, strct) ((unsigned long)&((strct *)0)->field)
 
@@ -1217,7 +1217,6 @@ install_breakpoints(struct thread *thr, struct loaded_object *lo)
 			;
 		if (bp)
 			continue;
-		printf("Install breakpoint on %lx\n", addr);
 		bp = set_breakpoint(thr, lo->instrs[x], lo, memory_access_breakpoint, lo);
 		if (lo->head_bp)
 			lo->head_bp->prev_lo = bp;
@@ -1271,12 +1270,6 @@ memory_access_breakpoint(struct thread *p, struct breakpoint *bp, void *ctxt,
 				     &it,
 				     prefixes,
 				     urs);
-
-	printf("%lx: Access %lx %c%c\n",
-	       urs->rip,
-	       modrm_addr,
-	       it.modrm_access_type & ACCESS_R ? 'r' : '.',
-	       it.modrm_access_type & ACCESS_W ? 'w' : '.');
 
 	if (it.modrm_access_type == ACCESS_R)
 		wp = set_watchpoint(p->process, modrm_addr, 8, 0);
@@ -1339,7 +1332,6 @@ memory_access_breakpoint(struct thread *p, struct breakpoint *bp, void *ctxt,
 		}
 	}
 
-	printf("Unsetting watchpoints.\n");
 	unset_watchpoint(wp);
 
 	install_breakpoints(p, bp->lo);
