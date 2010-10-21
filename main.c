@@ -23,6 +23,8 @@
 #include <string.h>
 #include <unistd.h>
 
+#define RESET_BREAKPOINTS_TIMEOUT 120
+
 #define offsetof(field, strct) ((unsigned long)&((strct *)0)->field)
 
 /* Annoyingly, the glibc headers don't include this, and it's hard to
@@ -510,7 +512,6 @@ handle_breakpoint(struct thread *thr)
 
 	get_regs(thr, &urs);
 	urs.rip -= 1;
-	printf("Breakpoint at %lx\n", urs.rip);
 	for (bp = thr->process->head_breakpoint; bp; bp = bp->next) {
 		if (bp->addr == urs.rip) {
 			bp->f(thr, bp, bp->ctxt, &urs);
@@ -619,7 +620,6 @@ spawn_child(const char *path, char *const argv[])
 static void
 add_mem_access_instr(struct loaded_object *lo, unsigned long addr)
 {
-	printf("Access at %lx\n", addr);
 	if (lo->nr_instrs == lo->nr_instrs_alloced) {
 		lo->nr_instrs_alloced *= 3;
 		lo->instrs = realloc(lo->instrs, sizeof(lo->instrs[0]) * lo->nr_instrs_alloced);
@@ -1318,7 +1318,7 @@ process_shlib(struct process *p, unsigned long start_vaddr,
 		return;
 	}
 
-	printf("%lx %s\n", start_vaddr - offset, fname);
+	printf("Processing %s at %lx\n", fname, start_vaddr - offset);
 	lo = calloc(sizeof(*lo), 1);
 	lo->name = strdup(fname);
 	lo->nr_instrs_alloced = 128;
@@ -1381,6 +1381,8 @@ process_shlib(struct process *p, unsigned long start_vaddr,
 	install_breakpoints(p->head_thread, lo);
 
 	munmap((void *)hdr, s);
+
+	printf("Done %s\n", fname);
 }
 
 static bool
@@ -1611,7 +1613,7 @@ main(int argc, char *argv[], char *environ[])
 	   process which sleeps 60 seconds and then exits. */
 	child->timeout_pid = fork();
 	if (child->timeout_pid == 0) {
-		sleep(5);
+		sleep(RESET_BREAKPOINTS_TIMEOUT);
 		_exit(0);
 	}
 
@@ -1627,7 +1629,7 @@ main(int argc, char *argv[], char *environ[])
 			child->timeout_fired = false;
 			child->timeout_pid = fork();
 			if (child->timeout_pid == 0) {
-				sleep(5);
+				sleep(RESET_BREAKPOINTS_TIMEOUT);
 				_exit(0);
 			}
 
@@ -1649,7 +1651,6 @@ main(int argc, char *argv[], char *environ[])
 			continue;
 		}
 
-		printf("%d: Stop status %x\n", thr->pid, thr->stop_status);
 		if (WIFEXITED(thr->stop_status)) {
 			printf("Child exited with status %d, doing the same thing\n",
 			       WEXITSTATUS(thr->stop_status));
