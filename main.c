@@ -23,6 +23,11 @@
 #include <string.h>
 #include <unistd.h>
 
+/* We aim to have one in TARGET_BREAKPOINT_RATION possible breakpoints
+   live at any one time */
+#define TARGET_BREAKPOINT_RATIO 1000
+
+/* Every n seconds, clear all breakpoints and set a new batch. */
 #define RESET_BREAKPOINTS_TIMEOUT 120
 
 #define offsetof(field, strct) ((unsigned long)&((strct *)0)->field)
@@ -36,12 +41,7 @@
 #endif
 
 #define PRELOAD_LIB_NAME "./ndc.so"
-#define PTRACE_OPTIONS \
-	(PTRACE_O_TRACEFORK |			\
-	 PTRACE_O_TRACEVFORK |			\
-	 PTRACE_O_TRACECLONE |			\
-	 PTRACE_O_TRACEEXEC |			\
-	 PTRACE_O_TRACEVFORKDONE)
+#define PTRACE_OPTIONS (PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC)
 
 static const char *target_binary;
 
@@ -71,6 +71,8 @@ struct loaded_object {
 	struct breakpoint *head_bp;
 	char *name;
 	bool live;
+
+	unsigned nr_breakpoints;
 
 	unsigned nr_instrs_alloced;
 	unsigned nr_instrs;
@@ -137,6 +139,10 @@ struct instr_template {
 	int modrm_access_type;
 };
 
+static void memory_access_breakpoint(struct thread *p, struct breakpoint *bp, void *ctxt,
+				     struct user_regs_struct *urs);
+
+#ifndef NDEBUG
 static void
 sanity_check_bp(const struct breakpoint *bp)
 {
@@ -166,6 +172,12 @@ sanity_check_lo(const struct loaded_object *lo)
 		sanity_check_bp(bp);
 	}
 }
+#else /* !NDEBUG */
+static void
+sanity_check_lo(const struct loaded_object *lo)
+{
+}
+#endif /* NDEBUG */
 
 static unsigned
 instr_size(const struct instr_template *it)
@@ -297,6 +309,8 @@ unset_breakpoint(struct thread *thr, struct breakpoint *bp)
 		}
 		if (bp->next_lo)
 			bp->next_lo->prev_lo = bp->prev_lo;
+		assert(bp->lo->nr_breakpoints);
+		bp->lo->nr_breakpoints--;
 	}
 
 	free(bp);
@@ -607,7 +621,6 @@ spawn_child(const char *path, char *const argv[])
 	if (!WIFSTOPPED(thr->stop_status) || WSTOPSIG(thr->stop_status) != SIGTRAP)
 		errx(1, "strange status %x from waitpid()", thr->stop_status);
 
-	/* Turn on basically all the options except TRACESYSGOOD */
 	if (ptrace(PTRACE_SETOPTIONS,
 		   thr->pid,
 		   NULL,
@@ -1160,6 +1173,38 @@ itimer_handler(int ignore)
 }
 
 static void
+install_breakpoints(struct thread *thr, struct loaded_object *lo)
+{
+	unsigned target_nr_breakpoints;
+	struct breakpoint *bp;
+	unsigned x;
+	unsigned long addr;
+
+	target_nr_breakpoints = lo->nr_instrs / TARGET_BREAKPOINT_RATIO;
+
+	printf("Have %d breakpoints, want %d\n", lo->nr_breakpoints,
+	       target_nr_breakpoints);
+
+	sanity_check_lo(lo);
+	while (lo->nr_breakpoints < target_nr_breakpoints) {
+		x = random() % lo->nr_instrs;
+		addr = lo->instrs[x];
+		for (bp = lo->head_bp; bp && bp->addr != addr; bp = bp->next_lo)
+			;
+		if (bp)
+			continue;
+		printf("Install breakpoint on %lx\n", addr);
+		bp = set_breakpoint(thr, lo->instrs[x], lo, memory_access_breakpoint, lo);
+		if (lo->head_bp)
+			lo->head_bp->prev_lo = bp;
+		bp->next_lo = lo->head_bp;
+		lo->head_bp = bp;
+		lo->nr_breakpoints++;
+	}
+	sanity_check_lo(lo);
+}
+
+static void
 memory_access_breakpoint(struct thread *p, struct breakpoint *bp, void *ctxt,
 			 struct user_regs_struct *urs)
 {
@@ -1170,6 +1215,8 @@ memory_access_breakpoint(struct thread *p, struct breakpoint *bp, void *ctxt,
 	struct watchpoint *wp;
 	struct itimerval itimer;
 
+	printf("Breakpoint on %lx fired.\n", bp->addr);
+
 	assert(bp->lo);
 	sanity_check_lo(bp->lo);
 
@@ -1178,8 +1225,10 @@ memory_access_breakpoint(struct thread *p, struct breakpoint *bp, void *ctxt,
 	if (ptrace(PTRACE_SETREGS, p->pid, NULL, urs) < 0)
 		err(1, "PTRACE_SETREGS");
 
-	if (p->process->nr_threads == 1)
+	if (p->process->nr_threads == 1) {
+		install_breakpoints(p, bp->lo);
 		return;
+	}
 
 	/* Set to contain a bunch of nops... */
 	memset(instr, 0x90, sizeof(instr));
@@ -1270,28 +1319,9 @@ memory_access_breakpoint(struct thread *p, struct breakpoint *bp, void *ctxt,
 	printf("Unsetting watchpoints.\n");
 	unset_watchpoint(wp);
 
-	/* XXX set another breakpoint at random */
+	install_breakpoints(p, bp->lo);
+
 	sanity_check_lo(bp->lo);
-}
-
-static void
-install_breakpoints(struct thread *thr, struct loaded_object *lo)
-{
-	unsigned nr_breakpoints;
-	struct breakpoint *bp;
-	/* For now, breakpoint on every memory access */
-	unsigned x;
-	nr_breakpoints = lo->nr_instrs;
-
-	sanity_check_lo(lo);
-	for (x = 0; x < nr_breakpoints; x++) {
-		bp = set_breakpoint(thr, lo->instrs[x], lo, memory_access_breakpoint, lo);
-		if (lo->head_bp)
-			lo->head_bp->prev_lo = bp;
-		bp->next_lo = lo->head_bp;
-		lo->head_bp = bp;
-	}
-	sanity_check_lo(lo);
 }
 
 static void
