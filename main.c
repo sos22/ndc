@@ -1193,6 +1193,13 @@ itimer_handler(int ignore)
 }
 
 static void
+clear_all_breakpoints(struct thread *thr, struct loaded_object *lo)
+{
+	while (lo->head_bp)
+		unset_breakpoint(thr, lo->head_bp);
+}
+
+static void
 install_breakpoints(struct thread *thr, struct loaded_object *lo)
 {
 	unsigned target_nr_breakpoints;
@@ -1683,8 +1690,10 @@ main(int argc, char *argv[], char *environ[])
 			if (status == -1)
 				pause_child(child->head_thread);
 
-			for (lo = child->head_loaded_object; lo; lo = lo->next)
+			for (lo = child->head_loaded_object; lo; lo = lo->next) {
+				clear_all_breakpoints(child->head_thread, lo);
 				install_breakpoints(child->head_thread, lo);
+			}
 
 			if (status == -1)
 				unpause_child(child->head_thread);
