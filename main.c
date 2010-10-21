@@ -768,14 +768,33 @@ done_prefixes:
 		case 0xaf: /* imul Gv, Ev */
 		case 0xb6: /* movz Gv, Eb */
 		case 0xb7: /* movz Gv, Ew */
+		case 0xbd: /* bsr Gv, Ev */
 		case 0xbe: /* movsz Gb, Eb */
 		case 0xbf: /* movsz Gb, Ew */
 			it->modrm_access_type = ACCESS_R;
 			break;
 
+		case 0xd6:
+			if (*prefixes & (1 << PFX_OPSIZE))
+				it->modrm_access_type = ACCESS_W;
+			else
+				it->modrm_access_type = ACCESS_R;
+			break;
+
+		case 0x7e: /* Movd with mode one of Ed/q, Pd/q; Vq, Wq; Ed/q, Vd/q */
+			if (*prefixes & (1 << PFX_REP))
+				it->modrm_access_type = ACCESS_R;
+			else
+				it->modrm_access_type = ACCESS_W;
+			break;
+
 		case 0x11:
 		case 0x90 ... 0x9f: /* setne */
 			it->modrm_access_type = ACCESS_W;
+			break;
+
+		case 0xc1: /* xadd Ev, Gv */
+			it->modrm_access_type = ACCESS_RW;
 			break;
 
 		case 0xc2:
