@@ -135,6 +135,36 @@ struct instr_template {
 	int modrm_access_type;
 };
 
+static void
+sanity_check_bp(const struct breakpoint *bp)
+{
+	if (bp->next)
+		assert(bp->next->prev == bp);
+	if (bp->prev)
+		assert(bp->prev->next == bp);
+	if (bp->next_lo) {
+		assert(bp->next_lo->prev_lo == bp);
+		assert(bp->lo);
+	}
+	if (bp->prev_lo) {
+		assert(bp->prev_lo->next_lo == bp);
+		assert(bp->lo);
+	} else if (bp->lo)
+		assert(bp->lo->head_bp == bp);
+}
+
+static void
+sanity_check_lo(const struct loaded_object *lo)
+{
+	const struct breakpoint *bp;
+	assert(lo->name);
+	assert(strlen(lo->name));
+	for (bp = lo->head_bp; bp; bp = bp->next_lo) {
+		assert(bp->lo == lo);
+		sanity_check_bp(bp);
+	}
+}
+
 static unsigned
 instr_size(const struct instr_template *it)
 {
@@ -1140,6 +1170,9 @@ memory_access_breakpoint(struct thread *p, struct breakpoint *bp, void *ctxt,
 	struct watchpoint *wp;
 	struct itimerval itimer;
 
+	assert(bp->lo);
+	sanity_check_lo(bp->lo);
+
 	/* No longer need this breakpoint. */
 	unset_breakpoint(p, bp);
 	if (ptrace(PTRACE_SETREGS, p->pid, NULL, urs) < 0)
@@ -1238,6 +1271,7 @@ memory_access_breakpoint(struct thread *p, struct breakpoint *bp, void *ctxt,
 	unset_watchpoint(wp);
 
 	/* XXX set another breakpoint at random */
+	sanity_check_lo(bp->lo);
 }
 
 static void
@@ -1249,6 +1283,7 @@ install_breakpoints(struct thread *thr, struct loaded_object *lo)
 	unsigned x;
 	nr_breakpoints = lo->nr_instrs;
 
+	sanity_check_lo(lo);
 	for (x = 0; x < nr_breakpoints; x++) {
 		bp = set_breakpoint(thr, lo->instrs[x], lo, memory_access_breakpoint, lo);
 		if (lo->head_bp)
@@ -1256,6 +1291,7 @@ install_breakpoints(struct thread *thr, struct loaded_object *lo)
 		bp->next_lo = lo->head_bp;
 		lo->head_bp = bp;
 	}
+	sanity_check_lo(lo);
 }
 
 static void
