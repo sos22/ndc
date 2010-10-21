@@ -1251,6 +1251,8 @@ install_breakpoints(struct thread *thr, struct loaded_object *lo)
 
 	for (x = 0; x < nr_breakpoints; x++) {
 		bp = set_breakpoint(thr, lo->instrs[x], lo, memory_access_breakpoint, lo);
+		if (lo->head_bp)
+			lo->head_bp->prev_lo = bp;
 		bp->next_lo = lo->head_bp;
 		lo->head_bp = bp;
 	}
