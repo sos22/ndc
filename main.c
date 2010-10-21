@@ -25,10 +25,14 @@
 
 /* We aim to have one in TARGET_BREAKPOINT_RATION possible breakpoints
    live at any one time */
-#define TARGET_BREAKPOINT_RATIO 10000
+#define TARGET_BREAKPOINT_RATIO 1000
 
 /* Every n seconds, clear all breakpoints and set a new batch. */
-#define RESET_BREAKPOINTS_TIMEOUT 120
+#define RESET_BREAKPOINTS_TIMEOUT 10
+
+/* How long to wiat for after we've hit a breakpoint.  In seconds, as
+ * a double. */
+#define DELAY_WHEN_BREAKPOINT_HIT 0.1
 
 #define offsetof(field, strct) ((unsigned long)&((strct *)0)->field)
 
@@ -1275,8 +1279,8 @@ memory_access_breakpoint(struct thread *p, struct breakpoint *bp, void *ctxt,
 	timer_fired = false;
 
 	memset(&itimer, 0, sizeof(itimer));
-	itimer.it_value.tv_sec = 1;
-	itimer.it_value.tv_usec = 0;
+	itimer.it_value.tv_sec = DELAY_WHEN_BREAKPOINT_HIT;
+	itimer.it_value.tv_usec = (DELAY_WHEN_BREAKPOINT_HIT - itimer.it_value.tv_sec) * 1e6;
 	setitimer(ITIMER_REAL, &itimer, NULL);
 
 	while (!timer_fired) {
@@ -1321,6 +1325,7 @@ memory_access_breakpoint(struct thread *p, struct breakpoint *bp, void *ctxt,
 			/* The itimer will interrupt any syscalls.
 			   Make sure we cancel it before going any
 			   further, to avoid confusion. */
+			printf("Every thread stopped.\n");
 			memset(&itimer, 0, sizeof(itimer));
 			setitimer(ITIMER_REAL, &itimer, NULL);
 			break;
@@ -1727,11 +1732,10 @@ main(int argc, char *argv[], char *environ[])
 			printf("...sigstop...\n");
 			resume_child(thr);
 		} else if (WIFSTOPPED(thr->stop_status)) {
-			printf("Child got signal %d, letting it go through.\n",
-			       WSTOPSIG(thr->stop_status));
 			if (ptrace(PTRACE_CONT, thr->pid, NULL,
 				   (unsigned long)WSTOPSIG(thr->stop_status)) < 0)
-				err(1, "forwarding signal to child with ptrace");
+				err(1, "forwarding signal %d to child with ptrace",
+				    WSTOPSIG(thr->stop_status));
 			thr->stop_status = -1;
 		} else {
 			fprintf(stderr, "unexpected waitpid status %x\n", thr->stop_status);
