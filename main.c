@@ -32,7 +32,7 @@
 
 /* How long to wiat for after we've hit a breakpoint.  In seconds, as
  * a double. */
-#define DELAY_WHEN_BREAKPOINT_HIT 0.01
+#define DELAY_WHEN_BREAKPOINT_HIT 0.001
 
 /* Define to turn on lots of extra tracing */
 #undef VERY_LOUD
@@ -232,16 +232,18 @@ memory_access_breakpoint(struct thread *p, struct breakpoint *bp, void *ctxt,
 	unsigned long modrm_addr;
 	struct watchpoint *wp;
 	struct itimerval itimer;
+	struct loaded_object *lo = bp->lo;
 
 	assert(bp->lo);
 	sanity_check_lo(bp->lo);
 
 	/* No longer need this breakpoint. */
 	unset_breakpoint(p, bp);
+	bp = NULL;
 	set_regs(p, urs);
 
 	if (p->process->nr_threads == 1) {
-		install_breakpoints(p, bp->lo);
+		install_breakpoints(p, lo);
 		return;
 	}
 
@@ -331,9 +333,9 @@ memory_access_breakpoint(struct thread *p, struct breakpoint *bp, void *ctxt,
 
 	unset_watchpoint(wp);
 
-	install_breakpoints(p, bp->lo);
+	install_breakpoints(p, lo);
 
-	sanity_check_lo(bp->lo);
+	sanity_check_lo(lo);
 }
 
 static bool
