@@ -150,6 +150,11 @@ struct loaded_object *process_shlib(struct process *p, unsigned long start_vaddr
 
 void add_mem_access_instr(struct loaded_object *lo, unsigned long addr);
 
+
+void my_setenv(const char *name, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+void sanity_check_lo(const struct loaded_object *lo);
+
+
 /* Annoyingly, the glibc headers don't include this, and it's hard to
    get the kernel ones to play nicely with the glibc ones.  Use the
    glibc ones and suplement with this one #define from the kernel
