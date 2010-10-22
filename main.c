@@ -744,11 +744,6 @@ spawn_child(const char *path, char *const argv[])
 static void
 add_mem_access_instr(struct loaded_object *lo, unsigned long addr)
 {
-#if 0
-	if (addr != 0x40cf07)
-		return;
-#endif
-
 #ifdef VERY_LOUD
 	printf("Found memory accessing instruction at %#lx\n", addr);
 #endif
