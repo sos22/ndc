@@ -25,6 +25,8 @@ struct loaded_object {
 
 	unsigned nr_breakpoints;
 
+	unsigned next_instr_to_set_bp_on;
+
 	unsigned nr_instrs_alloced;
 	unsigned nr_instrs;
 	unsigned long *instrs;

@@ -201,7 +201,7 @@ install_breakpoints(struct thread *thr, struct loaded_object *lo)
 
 	sanity_check_lo(lo);
 	while (lo->nr_breakpoints < target_nr_breakpoints) {
-		x = random() % lo->nr_instrs;
+		x = lo->next_instr_to_set_bp_on++ % lo->nr_instrs;
 		addr = lo->instrs[x];
 		for (bp = lo->head_bp; bp && bp->addr != addr; bp = bp->next_lo)
 			;

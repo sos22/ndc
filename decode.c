@@ -565,6 +565,7 @@ process_shlib(struct process *p, unsigned long start_vaddr,
 	lo->name = strdup(fname);
 	lo->nr_instrs_alloced = 128;
 	lo->nr_instrs = 0;
+	lo->next_instr_to_set_bp_on = random();
 	lo->instrs = calloc(sizeof(lo->instrs[0]), lo->nr_instrs_alloced);
 	lo->next = p->head_loaded_object;
 	lo->live = true;
