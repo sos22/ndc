@@ -61,7 +61,7 @@ modrm(const unsigned char *instr,
 	}
 
 	if (interesting)
-		add_mem_access_instr(lo, mapped_at);
+		add_mem_access_instr(lo, mapped_at, it->modrm_access_type);
 }
 
 void

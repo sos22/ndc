@@ -150,7 +150,7 @@ struct loaded_object *process_shlib(struct process *p, unsigned long start_vaddr
 				    unsigned long end_vaddr, unsigned long offset,
 				    const char *fname);
 
-void add_mem_access_instr(struct loaded_object *lo, unsigned long addr);
+void add_mem_access_instr(struct loaded_object *lo, unsigned long addr, int mode);
 
 
 void my_setenv(const char *name, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
