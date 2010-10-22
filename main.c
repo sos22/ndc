@@ -7,6 +7,7 @@
 #include <sys/time.h>
 #include <sys/user.h>
 #include <sys/wait.h>
+#include <argp.h>
 #include <assert.h>
 #include <ctype.h>
 #include <elf.h>
@@ -23,24 +24,15 @@
 
 #include "ndc.h"
 
-/* We aim to have one in TARGET_BREAKPOINT_RATION possible breakpoints
-   live at any one time */
-#define TARGET_BREAKPOINT_RATIO 10
-
-/* Every n seconds, clear all breakpoints and set a new batch. */
-#define RESET_BREAKPOINTS_TIMEOUT 1
-
-/* How long to wiat for after we've hit a breakpoint.  In seconds, as
- * a double. */
-#define DELAY_WHEN_BREAKPOINT_HIT 0.001
-
-/* Define to turn on lots of extra tracing */
-#undef VERY_LOUD
+static unsigned target_breakpoint_ratio = 10; /* One in n accesses
+						  gets a
+						  breakpoint. */
+static double reset_breakpoints_timeout = 1; /* in seconds */
+static double delay_when_breakpoint_hit = 0.001; /* in seconds */
+static const char *target_binary;
 
 #define PRELOAD_LIB_NAME "/local/scratch/sos22/notdc/ndc.so"
 #define PTRACE_OPTIONS (PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC | PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK | PTRACE_O_TRACEEXEC)
-
-static const char *target_binary;
 
 static void memory_access_breakpoint(struct thread *p, struct breakpoint *bp, void *ctxt,
 				     struct user_regs_struct *urs);
@@ -202,7 +194,7 @@ install_breakpoints(struct thread *thr, struct loaded_object *lo)
 	unsigned x;
 	unsigned long addr;
 
-	target_nr_breakpoints = lo->nr_instrs / TARGET_BREAKPOINT_RATIO;
+	target_nr_breakpoints = lo->nr_instrs / target_breakpoint_ratio;
 
 	sanity_check_lo(lo);
 	while (lo->nr_breakpoints < target_nr_breakpoints) {
@@ -275,8 +267,8 @@ memory_access_breakpoint(struct thread *p, struct breakpoint *bp, void *ctxt,
 	timer_fired = false;
 
 	memset(&itimer, 0, sizeof(itimer));
-	itimer.it_value.tv_sec = DELAY_WHEN_BREAKPOINT_HIT;
-	itimer.it_value.tv_usec = (DELAY_WHEN_BREAKPOINT_HIT - itimer.it_value.tv_sec) * 1e6;
+	itimer.it_value.tv_sec = delay_when_breakpoint_hit;
+	itimer.it_value.tv_usec = (delay_when_breakpoint_hit - itimer.it_value.tv_sec) * 1e6;
 	setitimer(ITIMER_REAL, &itimer, NULL);
 
 	do {
@@ -426,8 +418,14 @@ linker_did_something(struct thread *thr, struct breakpoint *_ign1, void *_ign2,
 		    executable == 'x' &&
 		    shlib_interesting(fname2)) {
 			lo = process_shlib(p, start, end, offset, fname2);
-			if (lo)
+			if (lo) {
+				if (lo->nr_instrs < target_breakpoint_ratio)
+					printf("%s has %d breakpointable instructions, and we want to monitor one in %d, which means that we'll monitor 0\n",
+					       fname,
+					       lo->nr_instrs,
+					       target_breakpoint_ratio);
 				install_breakpoints(p->head_thread, lo);
+			}
 		}
 
 		free(fname);
@@ -570,12 +568,81 @@ maybe_dump_debug_ring(int code, void *ignore)
 		dump_debug_ring();
 }
 
+static int
+parse_int_argument(const char *x)
+{
+	char *e;
+	long r;
+
+	errno = 0;
+	r = strtol(x, &e, 10);
+	if (!e || *e)
+		errno = EINVAL;
+	if (errno)
+		err(1, "expected an integer, got %s", x);
+	if (r != (int)r)
+		errx(1, "%ld is out of range", r);
+	return r;
+}
+
+static double
+parse_double_argument(const char *x)
+{
+	char *e;
+	double r;
+
+	errno = 0;
+	r = strtod(x, &e);
+	if (!e || *e)
+		errno = EINVAL;
+	if (errno)
+		err(1, "expected a double, got %s", x);
+	return r;
+}
+
+static struct argp_option argp_options[] = {
+	{ .name = "bp-ratio",
+	  .key = 'r',
+	  .arg = "INTEGER" },
+	{ .name = "reset-timeout",
+	  .key = 't',
+	  .arg = "SECONDS" },
+	{ .name = "bp-delay",
+	  .key = 'd',
+	  .arg = "SECONDS" },
+	{ 0 }
+};
+
+static error_t
+argp_parser(int key, char *arg, struct argp_state *state)
+{
+	switch (key) {
+	case 'r':
+		target_breakpoint_ratio = parse_int_argument(arg);
+		return 0;
+	case 't':
+		reset_breakpoints_timeout = parse_double_argument(arg);
+		return 0;
+	case 'd':
+		delay_when_breakpoint_hit = parse_double_argument(arg);
+		return 0;
+	default:
+		return ARGP_ERR_UNKNOWN;
+	}
+}
+
+static struct argp argp = {
+	.options = argp_options,
+	.parser = argp_parser
+};
+
 int
-main(int argc, char *argv[], char *environ[])
+main(int argc, char *argv[])
 {
 	struct process *child;
 	int r;
 	struct sigaction timer_sa;
+	int arg_index;
 
 	bzero(&timer_sa, sizeof(timer_sa));
 
@@ -587,9 +654,13 @@ main(int argc, char *argv[], char *environ[])
 	if (sigaction(SIGALRM, &timer_sa, NULL) < 0)
 		err(1, "installing SIGALRM handler");
 
-	target_binary = basename(argv[1]);
+	errno = argp_parse(&argp, argc, argv, 0, &arg_index, NULL);
+	if (errno)
+		err(1, "parsing arguments");
 
-	child = spawn_child(argv[1], argv + 1);
+	target_binary = basename(argv[arg_index]);
+
+	child = spawn_child(argv[arg_index], argv + arg_index);
 
 	/* Child starts stopped. */
 	assert(child->nr_threads == 1);
@@ -615,7 +686,7 @@ main(int argc, char *argv[], char *environ[])
 	   process which sleeps 60 seconds and then exits. */
 	child->timeout_pid = fork();
 	if (child->timeout_pid == 0) {
-		sleep(RESET_BREAKPOINTS_TIMEOUT);
+		dsleep(reset_breakpoints_timeout);
 		_exit(0);
 	}
 
@@ -629,7 +700,7 @@ main(int argc, char *argv[], char *environ[])
 			child->timeout_fired = false;
 			child->timeout_pid = fork();
 			if (child->timeout_pid == 0) {
-				sleep(RESET_BREAKPOINTS_TIMEOUT);
+				dsleep(reset_breakpoints_timeout);
 				_exit(0);
 			}
 

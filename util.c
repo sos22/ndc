@@ -4,11 +4,13 @@
 #include <sys/syscall.h>
 #include <sys/user.h>
 #include <assert.h>
+#include <errno.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #include "ndc.h"
 
@@ -65,6 +67,16 @@ my_setenv(const char *name, const char *fmt, ...)
 	va_end(args);
 	setenv(name, m, 1);
 	free(m);
+}
+
+void
+dsleep(double x)
+{
+	struct timespec ts;
+	ts.tv_sec = x;
+	ts.tv_nsec = (x - ts.tv_sec) * 1e9;
+	while (nanosleep(&ts, &ts) < 0 && errno == EINTR)
+		;
 }
 
 

@@ -153,6 +153,7 @@ void add_mem_access_instr(struct loaded_object *lo, unsigned long addr);
 
 void my_setenv(const char *name, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 void sanity_check_lo(const struct loaded_object *lo);
+void dsleep(double x);
 
 void vmsg(int prio, const char *fmt, va_list args);
 void msg(int prio, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
