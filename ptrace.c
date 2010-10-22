@@ -337,7 +337,9 @@ unset_watchpoint(struct watchpoint *w)
 		running = !thr_is_stopped(thr);
 
 		if (running)
-			pause_child(thr);
+			while (!pause_child(thr))
+				;
+
 		if (ptrace(PTRACE_POKEUSER, thr->pid,
 			   offsetof(u_debugreg[7], struct user),
 			   0) < 0)
