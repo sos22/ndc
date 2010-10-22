@@ -1,3 +1,5 @@
+CFLAGS+=-Wall -g
+
 all: ndc.so test_dlopen test.so test_race1 ndc
 
 ndc.so: ndc.po
@@ -15,5 +17,5 @@ test.so: test.po
 test_race1: test_race1.c
 	gcc -Wall -g -pthread -o $@ $^
 
-ndc: main.c
-	gcc -Wall -g main.c -o ndc
+ndc: main.o ptrace.o
+	gcc -Wall -g $^ -o $@
