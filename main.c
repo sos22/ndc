@@ -34,6 +34,9 @@
  * a double. */
 #define DELAY_WHEN_BREAKPOINT_HIT 0.01
 
+/* Define to turn on lots of extra tracing */
+#undef VERY_LOUD
+
 #define offsetof(field, strct) ((unsigned long)&((strct *)0)->field)
 
 /* Annoyingly, the glibc headers don't include this, and it's hard to
@@ -44,7 +47,7 @@
 #define TRAP_HWBKPT 4
 #endif
 
-#define PRELOAD_LIB_NAME "./ndc.so"
+#define PRELOAD_LIB_NAME "/local/scratch/sos22/notdc/ndc.so"
 #define PTRACE_OPTIONS (PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC)
 
 static const char *target_binary;
@@ -88,8 +91,8 @@ struct thread {
 	struct process *process;
 	pid_t pid;
 
-	int stop_status; /* from wait(), or -1 if it's currently
-			  * running */
+	int _stop_status; /* from wait() or -1 if it's currently
+			   * running */
 };
 
 /* Arggh... When a child clone()s itself, we need to process the
@@ -183,6 +186,34 @@ sanity_check_lo(const struct loaded_object *lo)
 }
 #endif /* NDEBUG */
 
+static int
+thr_stop_status(const struct thread *thr)
+{
+	assert(thr->_stop_status != -1);
+	return thr->_stop_status;
+}
+
+static bool
+thr_is_stopped(const struct thread *thr)
+{
+	return thr->_stop_status != -1;
+}
+
+static void
+thr_stopped(struct thread *thr, int status)
+{
+	assert(status != -1);
+	assert(thr->_stop_status == -1);
+	thr->_stop_status = status;
+}
+
+static void
+thr_resume(struct thread *thr)
+{
+	assert(thr->_stop_status != -1);
+	thr->_stop_status = -1;
+}
+
 static unsigned
 instr_size(const struct instr_template *it)
 {
@@ -193,7 +224,7 @@ static unsigned long
 fetch_ulong(struct thread *thr, unsigned long addr)
 {
 	unsigned long buf;
-	assert(thr->stop_status != -1);
+	assert(thr_is_stopped(thr));
 	errno = 0;
 	buf = ptrace(PTRACE_PEEKDATA, thr->pid, addr);
 	if (errno != 0)
@@ -229,7 +260,7 @@ _fetch_bytes(struct thread *thr, unsigned long addr, void *buf, size_t buf_size)
 	unsigned long align_end = (real_end + 7) & ~7ul;
 	unsigned long cursor;
 
-	assert(thr->stop_status != -1);
+	assert(thr_is_stopped(thr));
 	aligned_buf = alloca(align_end - align_start);
 	errno = 0;
 	for (cursor = align_start; cursor != align_end; cursor += 8) {
@@ -248,7 +279,14 @@ _fetch_bytes(struct thread *thr, unsigned long addr, void *buf, size_t buf_size)
 static void
 store_ulong(struct thread *thr, unsigned long addr, unsigned long ulong)
 {
-	assert(thr->stop_status != -1);
+#ifdef VERY_LOUD
+	unsigned long old;
+#endif
+	assert(thr_is_stopped(thr));
+#ifdef VERY_LOUD
+	old = fetch_ulong(thr, addr);
+	printf("%d: %lx@%lx -> %lx\n", thr->pid, old, addr, ulong);
+#endif
 	if (ptrace(PTRACE_POKEDATA, thr->pid, addr, ulong) < 0)
 		err(1, "poke(%lx, %lx)", addr, ulong);
 }
@@ -347,9 +385,7 @@ check_pending_waits(struct process *proc)
 	for (x = 0; x < proc->pws.nr_pending; ) {
 		thr = find_thread_by_pid(proc, proc->pws.pending[x].pid);
 		if (thr) {
-			thr->stop_status = proc->pws.pending[x].status;
-			printf("Pick up pending %x for pid %d\n",
-			       thr->stop_status, thr->pid);
+			thr_stopped(thr, proc->pws.pending[x].status);
 			memmove(proc->pws.pending + x,
 				proc->pws.pending + x + 1,
 				sizeof(proc->pws.pending[0]) * (proc->pws.nr_pending - x - 1));
@@ -400,12 +436,10 @@ receive_ptrace_event(struct process *proc)
 	assert(status != -1);
 
 	thr = find_thread_by_pid(proc, pid);
-	if (thr) {
-		thr->stop_status = status;
-	} else {
-		printf("Push to pending\n");
+	if (thr)
+		thr_stopped(thr, status);
+	else
 		push_pending_wait_status(&proc->pws, pid, status);
-	}
 
 	return true;
 }
@@ -413,11 +447,11 @@ receive_ptrace_event(struct process *proc)
 static bool
 pause_child(struct thread *thr)
 {
-	if (thr->stop_status != -1)
+	if (thr_is_stopped(thr))
 		return true;
 	if (tgkill(thr->process->tgid, thr->pid, SIGSTOP) < 0)
 		err(1, "kill(SIGSTOP)");
-	while (thr->stop_status == -1)
+	while (!thr_is_stopped(thr))
 		if (!receive_ptrace_event(thr->process))
 			return false;
 	return true;
@@ -426,17 +460,18 @@ pause_child(struct thread *thr)
 static void
 resume_child(struct thread *thr)
 {
-	if (thr->stop_status == -1)
+	if (!thr_is_stopped(thr))
 		return;
 	if (ptrace(PTRACE_CONT, thr->pid, NULL, NULL) < 0)
 		err(1, "ptrace(PTRACE_CONT) from resume_child()");
-	thr->stop_status = -1;
+	thr_resume(thr);
 }
 
 static void
 unpause_child(struct thread *thr)
 {
-	if (WIFSTOPPED(thr->stop_status) && WSTOPSIG(thr->stop_status) == SIGSTOP)
+	if (WIFSTOPPED(thr_stop_status(thr)) &&
+	    WSTOPSIG(thr_stop_status(thr)) == SIGSTOP)
 		resume_child(thr);
 }
 
@@ -470,10 +505,11 @@ set_watchpoint(struct process *p, unsigned long addr, unsigned size, int watch_r
 	}
 
 	for (thr = p->head_thread; thr; thr = thr->next) {
-		running = thr->stop_status == -1;
+		running = !thr_is_stopped(thr);
 		if (running)
 			pause_child(thr);
 
+#if 0
 		if (ptrace(PTRACE_POKEUSER, thr->pid,
 			   offsetof(u_debugreg[0], struct user),
 			   addr) < 0)
@@ -484,6 +520,7 @@ set_watchpoint(struct process *p, unsigned long addr, unsigned size, int watch_r
 			   ((watch_reads ? 3 : 1) << 16) |
 			   1) < 0)
 			err(1, "Setting debug register 7 of %d", thr->pid);
+#endif
 
 		if (running)
 			unpause_child(thr);
@@ -501,14 +538,16 @@ unset_watchpoint(struct watchpoint *w)
 	bool running;
 
 	for (thr = p->head_thread; thr; thr = thr->next) {
-		running = thr->stop_status == -1;
+		running = !thr_is_stopped(thr);
 
 		if (running)
 			pause_child(thr);
+#if 0
 		if (ptrace(PTRACE_POKEUSER, thr->pid,
 			   offsetof(u_debugreg[7], struct user),
 			   0) < 0)
 			err(1, "Clearing debug register 7 of %d", thr->pid);
+#endif
 		if (running)
 			unpause_child(thr);
 	}
@@ -517,9 +556,64 @@ unset_watchpoint(struct watchpoint *w)
 static void
 get_regs(struct thread *thr, struct user_regs_struct *urs)
 {
-	assert(thr->stop_status != -1);
+	assert(thr_is_stopped(thr));
 	if (ptrace(PTRACE_GETREGS, thr->pid, NULL, urs) < 0)
-		err(1, "PTRACE_GETREGS()");
+		err(1, "PTRACE_GETREGS(%d)", thr->pid);
+}
+
+#ifdef VERY_LOUD
+static void
+show_regs_delta(const struct user_regs_struct *from,
+		const struct user_regs_struct *to)
+{
+#define do_reg(rname)							\
+	if (from-> rname != to-> rname)					\
+		printf(#rname ": %lx -> %lx ", from-> rname,		\
+		       to-> rname)
+	do_reg(r15);
+	do_reg(r14);
+	do_reg(r13);
+	do_reg(r12);
+	do_reg(r11);
+	do_reg(r10);
+	do_reg(r9);
+	do_reg(r8);
+	do_reg(rax);
+	do_reg(rcx);
+	do_reg(rdx);
+	do_reg(rbx);
+	do_reg(rsp);
+	do_reg(rbp);
+	do_reg(rsi);
+	do_reg(rdi);
+	do_reg(orig_rax);
+	do_reg(rip);
+	do_reg(cs);
+	do_reg(eflags);
+	do_reg(ss);
+	do_reg(fs_base);
+	do_reg(gs_base);
+	do_reg(ds);
+	do_reg(es);
+	do_reg(fs);
+	do_reg(gs);
+#undef do_reg
+}
+#endif /* VERY_LOUD */
+
+static void
+set_regs(struct thread *thr, const struct user_regs_struct *urs)
+{
+#ifdef VERY_LOUD
+	struct user_regs_struct urs2;
+	get_regs(thr, &urs2);
+	printf("%d: ", thr->pid);
+	show_regs_delta(&urs2, urs);
+	printf("\n");
+#endif /* VERY_LOUD */
+	assert(thr_is_stopped(thr));
+	if (ptrace(PTRACE_SETREGS, thr->pid, NULL, urs))
+		err(1, "PTRACE_SETREGS(%d)", thr->pid);
 }
 
 static void
@@ -527,6 +621,16 @@ handle_breakpoint(struct thread *thr)
 {
 	struct user_regs_struct urs;
 	struct breakpoint *bp;
+	siginfo_t si;
+
+	if (ptrace(PTRACE_GETSIGINFO, thr->pid, NULL, &si) < 0)
+		err(1, "PTRACE_GETSIGINFO2(%d)", thr->pid);
+	if (si.si_code == TRAP_HWBKPT) {
+		/* It's a watchpoint.  This can happen due to some races in
+		   the way we clear watchpoints; just ignore it. */
+		resume_child(thr);
+		return;
+	}
 
 	get_regs(thr, &urs);
 	urs.rip -= 1;
@@ -542,6 +646,8 @@ handle_breakpoint(struct thread *thr)
 	   the breakpoint before we notice that it stopped.  Ignore
 	   it. */
 	printf("... not one of our breakpoints at %lx...\n", urs.rip);
+
+	set_regs(thr, &urs);
 	resume_child(thr);
 }
 
@@ -581,7 +687,7 @@ spawn_child(const char *path, char *const argv[])
 	work->head_thread = thr;
 	work->nr_threads = 1;
 	thr->process = work;
-	thr->stop_status = -1;
+	thr->_stop_status = -1;
 	if (pipe(p1) < 0 || pipe(p2) < 0)
 		err(1, "pipe()");
 	work->tgid = thr->pid = fork();
@@ -619,11 +725,12 @@ spawn_child(const char *path, char *const argv[])
 
 	on_exit(kill_child, work);
 
-	while (thr->stop_status == -1)
+	while (!thr_is_stopped(thr))
 		if (!receive_ptrace_event(work))
 			abort();
-	if (!WIFSTOPPED(thr->stop_status) || WSTOPSIG(thr->stop_status) != SIGTRAP)
-		errx(1, "strange status %x from waitpid()", thr->stop_status);
+	if (!WIFSTOPPED(thr_stop_status(thr)) ||
+	    WSTOPSIG(thr_stop_status(thr)) != SIGTRAP)
+		errx(1, "strange status %x from waitpid()", thr_stop_status(thr));
 
 	if (ptrace(PTRACE_SETOPTIONS,
 		   thr->pid,
@@ -1243,8 +1350,7 @@ memory_access_breakpoint(struct thread *p, struct breakpoint *bp, void *ctxt,
 
 	/* No longer need this breakpoint. */
 	unset_breakpoint(p, bp);
-	if (ptrace(PTRACE_SETREGS, p->pid, NULL, urs) < 0)
-		err(1, "PTRACE_SETREGS");
+	set_regs(p, urs);
 
 	if (p->process->nr_threads == 1) {
 		install_breakpoints(p, bp->lo);
@@ -1283,22 +1389,25 @@ memory_access_breakpoint(struct thread *p, struct breakpoint *bp, void *ctxt,
 	itimer.it_value.tv_usec = (DELAY_WHEN_BREAKPOINT_HIT - itimer.it_value.tv_sec) * 1e6;
 	setitimer(ITIMER_REAL, &itimer, NULL);
 
-	while (!timer_fired) {
+	do {
 		struct thread *other;
 		bool nothing_running = true;
-		if (!receive_ptrace_event(p->process))
-			continue;
+
+		/* XXX there's a massive race here: if the alarm fires
+		   between the test of timer_fired and the wait
+		   syscall we'll deadlock! */
+		receive_ptrace_event(p->process);
 		for (other = p->process->head_thread;
 		     other;
 		     other = other->next) {
 			if (other == p)
 				continue;
-			if (other->stop_status == -1) {
+			if (!thr_is_stopped(other)) {
 				nothing_running = false;
 				continue;
 			}
-			if (WIFSTOPPED(other->stop_status) &&
-			    WSTOPSIG(other->stop_status) == SIGTRAP) {
+			if (WIFSTOPPED(thr_stop_status(other)) &&
+			    WSTOPSIG(thr_stop_status(other)) == SIGTRAP) {
 				/* It stopped for either a watchpoint
 				 * or a breakpoint.  Find out
 				 * which. */
@@ -1330,7 +1439,7 @@ memory_access_breakpoint(struct thread *p, struct breakpoint *bp, void *ctxt,
 			setitimer(ITIMER_REAL, &itimer, NULL);
 			break;
 		}
-	}
+	} while (!timer_fired);
 
 	unset_watchpoint(wp);
 
@@ -1642,7 +1751,6 @@ main(int argc, char *argv[], char *environ[])
 		 sizeof(child->linker_brk_addr));
 	if (r != sizeof(child->linker_brk_addr))
 		err(1, "reading child's linker break address");
-	printf("Child break %lx\n", child->linker_brk_addr);
 	pause_child(child->head_thread);
 	set_breakpoint(child->head_thread, child->linker_brk_addr, NULL,
 		       linker_did_something, NULL);
@@ -1669,8 +1777,6 @@ main(int argc, char *argv[], char *environ[])
 			int status;
 			struct loaded_object *lo;
 
-			printf("TIMEOUT\n");
-
 			child->timeout_fired = false;
 			child->timeout_pid = fork();
 			if (child->timeout_pid == 0) {
@@ -1678,7 +1784,7 @@ main(int argc, char *argv[], char *environ[])
 				_exit(0);
 			}
 
-			status = child->head_thread->stop_status;
+			status = child->head_thread->_stop_status;
 			if (status == -1)
 				pause_child(child->head_thread);
 
@@ -1691,19 +1797,19 @@ main(int argc, char *argv[], char *environ[])
 				unpause_child(child->head_thread);
 		}
 
-		for (thr = child->head_thread; thr && thr->stop_status == -1; thr = thr->next)
+		for (thr = child->head_thread; thr && !thr_is_stopped(thr); thr = thr->next)
 			;
 		if (!thr) {
 			receive_ptrace_event(child);
 			continue;
 		}
 
-		if (WIFEXITED(thr->stop_status)) {
-			printf("Child exited with status %d, doing the same thing\n",
-			       WEXITSTATUS(thr->stop_status));
-			thread_exited(thr, WEXITSTATUS(thr->stop_status));
-		} else if (WIFSIGNALED(thr->stop_status)) {
-			printf("Child got signal %d\n", WTERMSIG(thr->stop_status));
+		if (WIFEXITED(thr_stop_status(thr))) {
+			printf("Child exited with status %d, doing the same thing (%x)\n",
+			       WEXITSTATUS(thr_stop_status(thr)), thr_stop_status(thr));
+			thread_exited(thr, WEXITSTATUS(thr_stop_status(thr)));
+		} else if (WIFSIGNALED(thr_stop_status(thr))) {
+			printf("Child got signal %d\n", WTERMSIG(thr_stop_status(thr)));
 			/* Should arguably raise() the signal here,
 			   rather than exiting, so that our parent
 			   gets the right status, but that might cause
@@ -1711,35 +1817,35 @@ main(int argc, char *argv[], char *environ[])
 			   obliterate any core dump left behind by the
 			   child. */
 			exit(1);
-		} else if (WIFSTOPPED(thr->stop_status) &&
-			   WSTOPSIG(thr->stop_status) == SIGTRAP) {
-			switch (thr->stop_status >> 16) {
+		} else if (WIFSTOPPED(thr_stop_status(thr)) &&
+			   WSTOPSIG(thr_stop_status(thr)) == SIGTRAP) {
+			switch (thr_stop_status(thr) >> 16) {
 			case 0:
 				handle_breakpoint(thr);
 				break;
 			case PTRACE_EVENT_CLONE:
-				printf("Child spawned a new thread...\n");
 				handle_clone(thr);
 				break;
 			default:
-				fprintf(stderr, "unknown ptrace event %d\n", thr->stop_status >> 16);
+				fprintf(stderr, "unknown ptrace event %d\n", thr_stop_status(thr) >> 16);
 				abort();
 			}
-		} else if (WIFSTOPPED(thr->stop_status) &&
-			   WSTOPSIG(thr->stop_status) == SIGSTOP) {
+		} else if (WIFSTOPPED(thr_stop_status(thr)) &&
+			   WSTOPSIG(thr_stop_status(thr)) == SIGSTOP) {
 			/* Sometimes get these spuriously when
 			 * attaching to a new thread or as a resule of
 			 * pause_thread().  Ignore. */
-			printf("...sigstop...\n");
 			resume_child(thr);
-		} else if (WIFSTOPPED(thr->stop_status)) {
+		} else if (WIFSTOPPED(thr_stop_status(thr))) {
+			printf("Sending signal %d to child %d\n",
+			       WSTOPSIG(thr_stop_status(thr)), thr->pid);
 			if (ptrace(PTRACE_CONT, thr->pid, NULL,
-				   (unsigned long)WSTOPSIG(thr->stop_status)) < 0)
-				err(1, "forwarding signal %d to child with ptrace",
-				    WSTOPSIG(thr->stop_status));
-			thr->stop_status = -1;
+				   (unsigned long)WSTOPSIG(thr_stop_status(thr))) < 0)
+				err(1, "forwarding signal %d to child %d with ptrace",
+				    WSTOPSIG(thr_stop_status(thr)), thr->pid);
+			thr_resume(thr);
 		} else {
-			fprintf(stderr, "unexpected waitpid status %x\n", thr->stop_status);
+			fprintf(stderr, "unexpected waitpid status %x\n", thr_stop_status(thr));
 			abort();
 		}
 	}
