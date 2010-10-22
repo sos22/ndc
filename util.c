@@ -130,7 +130,7 @@ vmsg(int prio, const char *fmt, va_list args)
 	if (prio >= PRIO_STDERR)
 		fputs(m, stderr);
 	else if (prio >= PRIO_STDOUT)
-		puts(m);
+		fputs(m, stdout);
 
 	free(m);
 }
@@ -152,7 +152,7 @@ dump_debug_ring(void)
 	do {
 		drs = &dring.slots[dring.cons % NR_DRING_SLOTS];
 		while (drs->cons < drs->prod) {
-			puts(drs->content + drs->cons);
+			fputs(drs->content + drs->cons, stdout);
 			drs->cons += strlen(drs->content + drs->cons) + 1;
 		}
 		dring.cons++;
