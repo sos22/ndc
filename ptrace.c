@@ -87,14 +87,8 @@ _fetch_bytes(struct thread *thr, unsigned long addr, void *buf, size_t buf_size)
 static void
 store_ulong(struct thread *thr, unsigned long addr, unsigned long ulong)
 {
-#ifdef VERY_LOUD
-	unsigned long old;
-#endif
 	assert(thr_is_stopped(thr));
-#ifdef VERY_LOUD
-	old = fetch_ulong(thr, addr);
-	printf("%d: %lx@%lx -> %lx\n", thr->pid, old, addr, ulong);
-#endif
+	msg(0, "%d: %lx@%lx -> %lx\n", thr->pid, fetch_ulong(thr, addr), addr, ulong);
 	if (ptrace(PTRACE_POKEDATA, thr->pid, addr, ulong) < 0)
 		err(1, "poke(%lx, %lx)", addr, ulong);
 }
@@ -368,8 +362,8 @@ show_regs_delta(const struct user_regs_struct *from,
 {
 #define do_reg(rname)							\
 	if (from-> rname != to-> rname)					\
-		printf(#rname ": %lx -> %lx ", from-> rname,		\
-		       to-> rname)
+		msg(1, #rname ": %lx -> %lx ", from-> rname,		\
+		    to-> rname)
 	do_reg(r15);
 	do_reg(r14);
 	do_reg(r13);
@@ -407,9 +401,9 @@ set_regs(struct thread *thr, const struct user_regs_struct *urs)
 #ifdef VERY_LOUD
 	struct user_regs_struct urs2;
 	get_regs(thr, &urs2);
-	printf("%d: ", thr->pid);
+	msg(1, "%d: ", thr->pid);
 	show_regs_delta(&urs2, urs);
-	printf("\n");
+	msg(1, "\n");
 #endif /* VERY_LOUD */
 	assert(thr_is_stopped(thr));
 	if (ptrace(PTRACE_SETREGS, thr->pid, NULL, urs))
@@ -445,9 +439,7 @@ handle_breakpoint(struct thread *thr)
 	/* This can happen if a thread hits a breakpoint, but we clear
 	   the breakpoint before we notice that it stopped.  Ignore
 	   it. */
-#ifdef VERY_LOUD
-	printf("... not one of our breakpoints at %lx...\n", urs.rip);
-#endif
+	msg(5, "... not one of our breakpoints at %lx...\n", urs.rip);
 
 	set_regs(thr, &urs);
 	resume_child(thr);

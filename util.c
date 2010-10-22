@@ -66,3 +66,84 @@ my_setenv(const char *name, const char *fmt, ...)
 	setenv(name, m, 1);
 	free(m);
 }
+
+
+#define DRING_SLOT_SIZE 4080
+struct debug_ring_slot {
+	int prod;
+	int cons;
+	char content[DRING_SLOT_SIZE];
+};
+
+#define NR_DRING_SLOTS 8
+struct debug_ring {
+	unsigned prod;
+	unsigned cons;
+	struct debug_ring_slot slots[NR_DRING_SLOTS];
+};
+
+static struct debug_ring
+dring;
+
+void
+vmsg(int prio, const char *fmt, va_list args)
+{
+	char *m;
+	int sz;
+	struct debug_ring_slot *drs;
+
+	if (prio < PRIO_RING)
+		return;
+
+	vasprintf(&m, fmt, args);
+
+	sz = strlen(m);
+	drs = &dring.slots[dring.prod % NR_DRING_SLOTS];
+	if (drs->prod + sz + 1 > DRING_SLOT_SIZE) {
+		dring.prod++;
+		if (dring.prod == dring.cons + NR_DRING_SLOTS) {
+			dring.cons++;
+			dring.slots[dring.cons % NR_DRING_SLOTS].cons = 0;
+		}
+		drs = &dring.slots[dring.prod % NR_DRING_SLOTS];
+		drs->prod = 0;
+		drs->cons = 0;
+	}
+	assert(drs->prod + sz + 1 <= DRING_SLOT_SIZE);
+	memcpy(drs->content + drs->prod,
+	       m,
+	       sz + 1);
+	drs->prod += sz + 1;
+
+	if (prio >= PRIO_STDERR)
+		fputs(m, stderr);
+	else if (prio >= PRIO_STDOUT)
+		puts(m);
+
+	free(m);
+}
+
+void
+msg(int prio, const char *fmt, ...)
+{
+	va_list args;
+	va_start(args, fmt);
+	vmsg(prio, fmt, args);
+	va_end(args);
+}
+
+void
+dump_debug_ring(void)
+{
+	struct debug_ring_slot *drs;
+
+	do {
+		drs = &dring.slots[dring.cons % NR_DRING_SLOTS];
+		while (drs->cons < drs->prod) {
+			puts(drs->content + drs->cons);
+			drs->cons += strlen(drs->content + drs->cons) + 1;
+		}
+		dring.cons++;
+	} while (dring.cons <= dring.prod);
+	dring.cons--;
+}

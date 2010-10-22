@@ -560,7 +560,7 @@ process_shlib(struct process *p, unsigned long start_vaddr,
 		return lo;
 	}
 
-	printf("Processing %s at %lx\n", fname, start_vaddr - offset);
+	msg(15, "Processing %s at %lx\n", fname, start_vaddr - offset);
 	lo = calloc(sizeof(*lo), 1);
 	lo->name = strdup(fname);
 	lo->nr_instrs_alloced = 128;
@@ -622,7 +622,7 @@ process_shlib(struct process *p, unsigned long start_vaddr,
 
 	munmap((void *)hdr, s);
 
-	printf("Done %s\n", fname);
+	msg(10, "Done %s\n", fname);
 
 	return lo;
 }

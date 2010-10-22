@@ -153,9 +153,7 @@ spawn_child(const char *path, char *const argv[])
 void
 add_mem_access_instr(struct loaded_object *lo, unsigned long addr)
 {
-#ifdef VERY_LOUD
-	printf("Found memory accessing instruction at %#lx\n", addr);
-#endif
+	msg(1, "Found memory accessing instruction at %#lx\n", addr);
 
 	if (lo->nr_instrs == lo->nr_instrs_alloced) {
 		lo->nr_instrs_alloced *= 3;
@@ -172,11 +170,12 @@ report_race(struct thread *thr1, struct thread *thr2)
 
 	get_regs(thr1, &urs1);
 	get_regs(thr2, &urs2);
-	printf("Race detected between pid %d RIP %lx and pid %d RIP %lx\n",
-	       thr1->pid,
-	       urs1.rip,
-	       thr2->pid,
-	       urs2.rip);
+	msg(100,
+	    "Race detected between pid %d RIP %lx and pid %d RIP %lx\n",
+	    thr1->pid,
+	    urs1.rip,
+	    thr2->pid,
+	    urs2.rip);
 }
 
 static volatile bool
@@ -323,7 +322,7 @@ memory_access_breakpoint(struct thread *p, struct breakpoint *bp, void *ctxt,
 			/* The itimer will interrupt any syscalls.
 			   Make sure we cancel it before going any
 			   further, to avoid confusion. */
-			printf("Every thread stopped.\n");
+			msg(9, "Every thread stopped.\n");
 			memset(&itimer, 0, sizeof(itimer));
 			setitimer(ITIMER_REAL, &itimer, NULL);
 			break;
@@ -347,7 +346,7 @@ shlib_interesting(char *fname)
 static void
 unloaded_object(struct thread *thr, struct loaded_object *lo)
 {
-	printf("Unloaded %s\n", lo->name);
+	msg(50, "Unloaded %s\n", lo->name);
 
 	while (lo->head_bp)
 		unset_breakpoint(thr, lo->head_bp);
@@ -489,7 +488,7 @@ handle_clone(struct thread *parent)
 
 	if (ptrace(PTRACE_GETEVENTMSG, parent->pid, NULL, &new_pid) < 0)
 		err(1, "PTRACE_GETEVENTMSG() for clone");
-	printf("New pid %ld\n", new_pid);
+	msg(50, "New pid %ld\n", new_pid);
 	thr = calloc(sizeof(*thr), 1);
 	thr->pid = new_pid;
 	thr->process = parent->process;
@@ -543,13 +542,13 @@ handle_fork(struct thread *thr)
 	if (ptrace(PTRACE_DETACH, new_pid) < 0)
 		err(1, "detaching forked child");
 
-	printf("%d forked %zd, ignoring...\n", thr->pid, new_pid);
+	msg(10, "%d forked %zd, ignoring...\n", thr->pid, new_pid);
 }
 
 static void
 thread_exited(struct thread *thr, int status)
 {
-	printf("Thread %d exited\n", thr->pid);
+	msg(50, "Thread %d exited\n", thr->pid);
 	if (thr->next)
 		thr->next->prev = thr->prev;
 	if (thr->prev)
@@ -562,6 +561,13 @@ thread_exited(struct thread *thr, int status)
 	free(thr);
 }
 
+static void
+maybe_dump_debug_ring(int code, void *ignore)
+{
+	if (code != 0)
+		dump_debug_ring();
+}
+
 int
 main(int argc, char *argv[], char *environ[])
 {
@@ -570,6 +576,9 @@ main(int argc, char *argv[], char *environ[])
 	struct sigaction timer_sa;
 
 	bzero(&timer_sa, sizeof(timer_sa));
+
+	on_exit(maybe_dump_debug_ring, NULL);
+	signal(SIGABRT, (void (*)(int))dump_debug_ring);
 
 	timer_sa.sa_handler = itimer_handler;
 	sigemptyset(&timer_sa.sa_mask);
@@ -643,11 +652,11 @@ main(int argc, char *argv[], char *environ[])
 		}
 
 		if (WIFEXITED(thr_stop_status(thr))) {
-			printf("Child exited with status %d, doing the same thing (%x)\n",
+			msg(15, "Child exited with status %d, doing the same thing (%x)\n",
 			       WEXITSTATUS(thr_stop_status(thr)), thr_stop_status(thr));
 			thread_exited(thr, WEXITSTATUS(thr_stop_status(thr)));
 		} else if (WIFSIGNALED(thr_stop_status(thr))) {
-			printf("Child got signal %d\n", WTERMSIG(thr_stop_status(thr)));
+			msg(100, "Child got signal %d\n", WTERMSIG(thr_stop_status(thr)));
 			/* Should arguably raise() the signal here,
 			   rather than exiting, so that our parent
 			   gets the right status, but that might cause
@@ -678,8 +687,8 @@ main(int argc, char *argv[], char *environ[])
 			 * pause_thread().  Ignore. */
 			resume_child(thr);
 		} else if (WIFSTOPPED(thr_stop_status(thr))) {
-			printf("Sending signal %d to child %d\n",
-			       WSTOPSIG(thr_stop_status(thr)), thr->pid);
+			msg(20, "Sending signal %d to child %d\n",
+			    WSTOPSIG(thr_stop_status(thr)), thr->pid);
 			if (ptrace(PTRACE_CONT, thr->pid, NULL,
 				   (unsigned long)WSTOPSIG(thr_stop_status(thr))) < 0)
 				err(1, "forwarding signal %d to child %d with ptrace",
