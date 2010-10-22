@@ -17,5 +17,5 @@ test.so: test.po
 test_race1: test_race1.c
 	gcc -Wall -g -pthread -o $@ $^
 
-ndc: main.o ptrace.o
+ndc: main.o ptrace.o decode.o
 	gcc -Wall -g $^ -o $@

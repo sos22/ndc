@@ -75,6 +75,37 @@ struct process {
 	struct pending_wait_status pws;
 };
 
+/* An x86 instruction consists of
+
+   -- Some prefixes
+   -- One or two bytes of opcode
+   -- An optional modrm,sib,disp complex
+   -- Some bytes of immediate data
+
+   The template gives you the breakdown of the instruction into those
+   bytes, and also tells you the type of modrm which is in use (read,
+   write, no-access, etc.)
+
+   Prefixes should really be divided into legacy and REX blocks, where
+   there is at most one REX prefix, but we don't bother.
+*/
+struct instr_template {
+	int bytes_prefix;
+	int bytes_opcode;
+	int bytes_modrm; /* includes SIB and displacement, if present */
+	int bytes_immediate;
+	int modrm_access_type;
+};
+
+/* Invalid -> there is no modrm, none -> there is a modrm but it's not
+ * used to access memory */
+#define ACCESS_INVALID 0
+#define ACCESS_R 1
+#define ACCESS_W 2
+#define ACCESS_RW 3
+#define ACCESS_NONE 4
+
+
 struct breakpoint *set_breakpoint(struct thread *thr,
 				  unsigned long addr,
 				  struct loaded_object *lo,
@@ -104,6 +135,20 @@ int thr_stop_status(const struct thread *thr);
 bool thr_is_stopped(const struct thread *thr);
 void thr_stopped(struct thread *thr, int status);
 void thr_resume(struct thread *thr);
+
+void find_instr_template(const unsigned char *instr,
+			 unsigned long addr,
+			 struct instr_template *it,
+			 unsigned *prefixes);
+unsigned long eval_modrm_addr(const unsigned char *modrm_bytes,
+			      const struct instr_template *it,
+			      unsigned prefixes,
+			      const struct user_regs_struct *urs);
+struct loaded_object *process_shlib(struct process *p, unsigned long start_vaddr,
+				    unsigned long end_vaddr, unsigned long offset,
+				    const char *fname);
+
+void add_mem_access_instr(struct loaded_object *lo, unsigned long addr);
 
 /* Annoyingly, the glibc headers don't include this, and it's hard to
    get the kernel ones to play nicely with the glibc ones.  Use the
