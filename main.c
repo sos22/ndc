@@ -28,7 +28,7 @@
 #define TARGET_BREAKPOINT_RATIO 10
 
 /* Every n seconds, clear all breakpoints and set a new batch. */
-#define RESET_BREAKPOINTS_TIMEOUT 120
+#define RESET_BREAKPOINTS_TIMEOUT 1
 
 /* How long to wiat for after we've hit a breakpoint.  In seconds, as
  * a double. */
@@ -48,7 +48,7 @@
 #endif
 
 #define PRELOAD_LIB_NAME "/local/scratch/sos22/notdc/ndc.so"
-#define PTRACE_OPTIONS (PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC)
+#define PTRACE_OPTIONS (PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC | PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK | PTRACE_O_TRACEEXEC)
 
 static const char *target_binary;
 
@@ -507,9 +507,10 @@ set_watchpoint(struct process *p, unsigned long addr, unsigned size, int watch_r
 	for (thr = p->head_thread; thr; thr = thr->next) {
 		running = !thr_is_stopped(thr);
 		if (running)
-			pause_child(thr);
+			while (!pause_child(thr))
+				;
+		assert(thr_is_stopped(thr));
 
-#if 0
 		if (ptrace(PTRACE_POKEUSER, thr->pid,
 			   offsetof(u_debugreg[0], struct user),
 			   addr) < 0)
@@ -520,7 +521,6 @@ set_watchpoint(struct process *p, unsigned long addr, unsigned size, int watch_r
 			   ((watch_reads ? 3 : 1) << 16) |
 			   1) < 0)
 			err(1, "Setting debug register 7 of %d", thr->pid);
-#endif
 
 		if (running)
 			unpause_child(thr);
@@ -542,12 +542,10 @@ unset_watchpoint(struct watchpoint *w)
 
 		if (running)
 			pause_child(thr);
-#if 0
 		if (ptrace(PTRACE_POKEUSER, thr->pid,
 			   offsetof(u_debugreg[7], struct user),
 			   0) < 0)
 			err(1, "Clearing debug register 7 of %d", thr->pid);
-#endif
 		if (running)
 			unpause_child(thr);
 	}
@@ -645,7 +643,9 @@ handle_breakpoint(struct thread *thr)
 	/* This can happen if a thread hits a breakpoint, but we clear
 	   the breakpoint before we notice that it stopped.  Ignore
 	   it. */
+#ifdef VERY_LOUD
 	printf("... not one of our breakpoints at %lx...\n", urs.rip);
+#endif
 
 	set_regs(thr, &urs);
 	resume_child(thr);
@@ -744,6 +744,15 @@ spawn_child(const char *path, char *const argv[])
 static void
 add_mem_access_instr(struct loaded_object *lo, unsigned long addr)
 {
+#if 0
+	if (addr != 0x40cf07)
+		return;
+#endif
+
+#ifdef VERY_LOUD
+	printf("Found memory accessing instruction at %#lx\n", addr);
+#endif
+
 	if (lo->nr_instrs == lo->nr_instrs_alloced) {
 		lo->nr_instrs_alloced *= 3;
 		lo->instrs = realloc(lo->instrs, sizeof(lo->instrs[0]) * lo->nr_instrs_alloced);
@@ -1655,24 +1664,14 @@ linker_did_something(struct thread *thr, struct breakpoint *_ign1, void *_ign2,
 	fclose(f);
 }
 
-static void
-handle_clone(struct thread *parent)
+static int
+get_stop_status(pid_t pid, struct pending_wait_status *pws)
 {
-	struct thread *thr;
-	unsigned long new_pid;
-	int status;
 	int x;
-	struct pending_wait_status *pws = &parent->process->pws;
-
-	if (ptrace(PTRACE_GETEVENTMSG, parent->pid, NULL, &new_pid) < 0)
-		err(1, "PTRACE_GETEVENTMSG() for clone");
-	printf("New pid %ld\n", new_pid);
-	thr = calloc(sizeof(*thr), 1);
-	thr->pid = new_pid;
-	thr->process = parent->process;
+	int status;
 
 	for (x = 0; x < pws->nr_pending; x++) {
-		if (pws->pending[x].pid == thr->pid) {
+		if (pws->pending[x].pid == pid) {
 			/* The STOP has already been reported by the
 			   kernel.  Use the stashed value. */
 			status = pws->pending[x].status;
@@ -1680,13 +1679,28 @@ handle_clone(struct thread *parent)
 				pws->pending + x + 1,
 				sizeof(pws->pending[0]) & (pws->nr_pending - x - 1));
 			pws->nr_pending--;
-			goto done_wait;
+			return status;
 		}
 	}
-	if (waitpid(thr->pid, &status, __WALL) < 0)
-		err(1, "waitpid() for new thread %d", thr->pid);
+	if (waitpid(pid, &status, __WALL) < 0)
+		err(1, "waitpid() for new thread %d", pid);
+	return status;
+}
 
-done_wait:
+static void
+handle_clone(struct thread *parent)
+{
+	struct thread *thr;
+	unsigned long new_pid;
+	int status;
+
+	if (ptrace(PTRACE_GETEVENTMSG, parent->pid, NULL, &new_pid) < 0)
+		err(1, "PTRACE_GETEVENTMSG() for clone");
+	printf("New pid %ld\n", new_pid);
+	thr = calloc(sizeof(*thr), 1);
+	thr->pid = new_pid;
+	thr->process = parent->process;
+	status = get_stop_status(new_pid, &parent->process->pws);
 	if (!WIFSTOPPED(status)) {
 		fprintf(stderr, "unexpected waitpid status %d for clone\n", status);
 		abort();
@@ -1706,6 +1720,37 @@ done_wait:
 	/* And let them both go */
 	resume_child(thr);
 	resume_child(parent);
+}
+
+/* The child fork()ed.  We're not going to trace the new process, but
+   we do need to make sure we get rid of all of our breakpoints. */
+static void
+handle_fork(struct thread *thr)
+{
+	unsigned long new_pid;
+	int status;
+	struct breakpoint *bp;
+	struct thread new_thr;
+
+	/* Wait for the kernel to attach it to us */
+	if (ptrace(PTRACE_GETEVENTMSG, thr->pid, NULL, &new_pid) < 0)
+		err(1, "PTRACE_GETEVENTMSG() for fork");
+	status = get_stop_status(new_pid, &thr->process->pws);
+	if (!WIFSTOPPED(status))
+		errx(1, "unexpected status %x for fork", status);
+
+	/* Hack: fake up a thread structure so that we have something
+	 * to pass to store_byte */
+	bzero(&new_thr, sizeof(new_thr));
+	new_thr.pid = new_pid;
+	for (bp = thr->process->head_breakpoint; bp; bp = bp->next)
+		store_byte(&new_thr, bp->addr, bp->old_content);
+
+	/* Detach it and let it go */
+	if (ptrace(PTRACE_DETACH, new_pid) < 0)
+		err(1, "detaching forked child");
+
+	printf("%d forked %zd, ignoring...\n", thr->pid, new_pid);
 }
 
 static void
@@ -1822,6 +1867,9 @@ main(int argc, char *argv[], char *environ[])
 			switch (thr_stop_status(thr) >> 16) {
 			case 0:
 				handle_breakpoint(thr);
+				break;
+			case PTRACE_EVENT_FORK:
+				handle_fork(thr);
 				break;
 			case PTRACE_EVENT_CLONE:
 				handle_clone(thr);
