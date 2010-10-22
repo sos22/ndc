@@ -29,6 +29,7 @@ static unsigned target_breakpoint_ratio = 10; /* One in n accesses
 						  breakpoint. */
 static double reset_breakpoints_timeout = 1; /* in seconds */
 static double delay_when_breakpoint_hit = 0.001; /* in seconds */
+static bool exit_on_first_race;
 static const char *target_binary;
 
 #define PRELOAD_LIB_NAME "/local/scratch/sos22/notdc/ndc.so"
@@ -168,6 +169,8 @@ report_race(struct thread *thr1, struct thread *thr2)
 	    urs1.rip,
 	    thr2->pid,
 	    urs2.rip);
+	if (exit_on_first_race)
+		exit(0);
 }
 
 static volatile bool
@@ -610,6 +613,8 @@ static struct argp_option argp_options[] = {
 	{ .name = "bp-delay",
 	  .key = 'd',
 	  .arg = "SECONDS" },
+	{ .name = "exit-on-race",
+	  .key = 'x' },
 	{ 0 }
 };
 
@@ -625,6 +630,9 @@ argp_parser(int key, char *arg, struct argp_state *state)
 		return 0;
 	case 'd':
 		delay_when_breakpoint_hit = parse_double_argument(arg);
+		return 0;
+	case 'x':
+		exit_on_first_race = true;
 		return 0;
 	default:
 		return ARGP_ERR_UNKNOWN;
