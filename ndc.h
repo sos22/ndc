@@ -7,8 +7,10 @@ struct thread;
 struct loaded_object;
 struct watchpoint;
 
+#ifndef __cplusplus
 #define offsetof(type, field)			        \
 (unsigned long)&((type *)0)->field
+#endif
 
 #define container_of(strct, type, field)		\
 (type *)((unsigned long)strct - offsetof(type, field))
@@ -112,6 +114,12 @@ struct thread {
 			   * running */
 };
 
+struct function {
+	struct list_entry list;
+	char *name;
+	unsigned long head;
+};
+
 struct loaded_object {
 	struct list_entry list;
 	struct list_head breakpoints;
@@ -126,6 +134,8 @@ struct loaded_object {
 	unsigned nr_instrs_alloced;
 	unsigned nr_instrs;
 	unsigned long *instrs;
+
+	struct list_head functions;
 };
 
 struct breakpoint {
@@ -171,6 +181,23 @@ struct process {
 	struct pending_wait_status pws;
 };
 
+#define PFX_REX_0         0
+#define PFX_REX_W         1
+#define PFX_REX_R         2
+#define PFX_REX_X         3
+#define PFX_REX_B         4
+#define PFX_OPSIZE        5
+#define PFX_ADDRSIZE      6
+#define PFX_CS            8
+#define PFX_DS            9
+#define PFX_ES           10
+#define PFX_FS           11
+#define PFX_GS           12
+#define PFX_SS           13
+#define PFX_LOCK         14
+#define PFX_REP          15
+#define PFX_REPN         16
+
 /* An x86 instruction consists of
 
    -- Some prefixes
@@ -191,6 +218,7 @@ struct instr_template {
 	int bytes_modrm; /* includes SIB and displacement, if present */
 	int bytes_immediate;
 	int modrm_access_type;
+	unsigned prefixes;
 };
 
 /* Invalid -> there is no modrm, none -> there is a modrm but it's not
@@ -234,11 +262,9 @@ void thr_resume(struct thread *thr);
 
 void find_instr_template(const unsigned char *instr,
 			 unsigned long addr,
-			 struct instr_template *it,
-			 unsigned *prefixes);
+			 struct instr_template *it);
 unsigned long eval_modrm_addr(const unsigned char *modrm_bytes,
 			      const struct instr_template *it,
-			      unsigned prefixes,
 			      const struct user_regs_struct *urs);
 struct loaded_object *process_shlib(struct process *p, unsigned long start_vaddr,
 				    unsigned long end_vaddr, unsigned long offset,
@@ -273,5 +299,24 @@ void dump_debug_ring(void);
 #define TRAP_HWBKPT 4
 #endif
 
+struct instruction {
+	struct list_entry list;
+	unsigned long addr;
+
+	struct instr_template template;
+	unsigned char text[16];
+
+	bool next_resolved;
+	bool branch_resolved;
+	union {
+		struct instruction *i;
+		unsigned long a;
+	} next, branch;
+};
+
+struct partial_cfg {
+	struct list_head instructions;
+	struct instruction *head;
+};
 
 #endif /* !NDC_H__ */

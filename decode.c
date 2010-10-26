@@ -14,23 +14,6 @@
 
 #include "ndc.h"
 
-#define PFX_REX_0         0
-#define PFX_REX_W         1
-#define PFX_REX_R         2
-#define PFX_REX_X         3
-#define PFX_REX_B         4
-#define PFX_OPSIZE        5
-#define PFX_ADDRSIZE      6
-#define PFX_CS            8
-#define PFX_DS            9
-#define PFX_ES           10
-#define PFX_FS           11
-#define PFX_GS           12
-#define PFX_SS           13
-#define PFX_LOCK         14
-#define PFX_REP          15
-#define PFX_REPN         16
-
 static unsigned
 instr_size(const struct instr_template *it)
 {
@@ -41,8 +24,7 @@ static void
 modrm(const unsigned char *instr,
       struct instr_template *it,
       unsigned long mapped_at,
-      struct loaded_object *lo,
-      unsigned prefixes)
+      struct loaded_object *lo)
 {
 	unsigned char modrm = instr[it->bytes_prefix + it->bytes_opcode];
 	unsigned rm = modrm & 7;
@@ -52,7 +34,7 @@ modrm(const unsigned char *instr,
 	if (mod == 3) {
 		/* Register -> not interesting */
 		interesting = 0;
-	} else if (rm == 4 && !(prefixes & (1 << PFX_REX_B))) {
+	} else if (rm == 4 && !(it->prefixes & (1 << PFX_REX_B))) {
 		unsigned base = instr[it->bytes_prefix + it->bytes_opcode + 1] & 7;
 		if (base == 4) {
 			/* Stack access -> not interesting */
@@ -67,8 +49,7 @@ modrm(const unsigned char *instr,
 void
 find_instr_template(const unsigned char *instr,
 		    unsigned long addr,
-		    struct instr_template *it,
-		    unsigned *prefixes)
+		    struct instr_template *it)
 {
 	unsigned opcode;
 	unsigned imm_opsize;
@@ -76,43 +57,42 @@ find_instr_template(const unsigned char *instr,
 	memset(it, 0, sizeof(*it));
 
 	it->modrm_access_type = ACCESS_INVALID;
-	*prefixes = 0;
 
 	while (1) {
 		it->bytes_prefix++;
 		switch (instr[it->bytes_prefix-1]) {
 		case 0x26:
-			*prefixes |= 1 << PFX_ES;
+			it->prefixes |= 1 << PFX_ES;
 			break;
 		case 0x2e:
-			*prefixes |= 1 << PFX_CS;
+			it->prefixes |= 1 << PFX_CS;
 			break;
 		case 0x36:
-			*prefixes |= 1 << PFX_SS;
+			it->prefixes |= 1 << PFX_SS;
 			break;
 		case 0x3e:
-			*prefixes |= 1 << PFX_DS;
+			it->prefixes |= 1 << PFX_DS;
 			break;
 		case 0x64:
-			*prefixes |= 1 << PFX_FS;
+			it->prefixes |= 1 << PFX_FS;
 			break;
 		case 0x65:
-			*prefixes |= 1 << PFX_GS;
+			it->prefixes |= 1 << PFX_GS;
 			break;
 		case 0x66:
-			*prefixes |= 1 << PFX_OPSIZE;
+			it->prefixes |= 1 << PFX_OPSIZE;
 			break;
 		case 0x67:
-			*prefixes |= 1 << PFX_ADDRSIZE;
+			it->prefixes |= 1 << PFX_ADDRSIZE;
 			break;
 		case 0xF0:
-			*prefixes |= 1 << PFX_LOCK;
+			it->prefixes |= 1 << PFX_LOCK;
 			break;
 		case 0xF2:
-			*prefixes |= 1 << PFX_REPN;
+			it->prefixes |= 1 << PFX_REPN;
 			break;
 		case 0xF3:
-			*prefixes |= 1 << PFX_REP;
+			it->prefixes |= 1 << PFX_REP;
 			break;
 		default:
 			goto done_prefixes;
@@ -122,20 +102,20 @@ done_prefixes:
 	it->bytes_prefix--;
 
 	if (instr[it->bytes_prefix] >= 0x40 && instr[it->bytes_prefix] <= 0x4f) {
-		*prefixes |= 1 << PFX_REX_0;
+		it->prefixes |= 1 << PFX_REX_0;
 		if (instr[it->bytes_prefix] & 1)
-			*prefixes |= 1 << PFX_REX_B;
+			it->prefixes |= 1 << PFX_REX_B;
 		if (instr[it->bytes_prefix] & 2)
-			*prefixes |= 1 << PFX_REX_X;
+			it->prefixes |= 1 << PFX_REX_X;
 		if (instr[it->bytes_prefix] & 4)
-			*prefixes |= 1 << PFX_REX_R;
+			it->prefixes |= 1 << PFX_REX_R;
 		if (instr[it->bytes_prefix] & 8)
-			*prefixes |= 1 << PFX_REX_W;
+			it->prefixes |= 1 << PFX_REX_W;
 		it->bytes_prefix++;
 	}
 
 	imm_opsize = 4;
-	if (*prefixes & (1 << PFX_OPSIZE))
+	if (it->prefixes & (1 << PFX_OPSIZE))
 		imm_opsize = 2;
 
 	it->bytes_opcode = 1;
@@ -194,7 +174,7 @@ done_prefixes:
 			break;
 
 		case 0xd6:
-			if (*prefixes & (1 << PFX_OPSIZE))
+			if (it->prefixes & (1 << PFX_OPSIZE))
 				it->modrm_access_type = ACCESS_W;
 			else
 				it->modrm_access_type = ACCESS_R;
@@ -206,7 +186,7 @@ done_prefixes:
 			break;
 
 		case 0x7e: /* Movd with mode one of Ed/q, Pd/q; Vq, Wq; Ed/q, Vd/q */
-			if (*prefixes & (1 << PFX_REP))
+			if (it->prefixes & (1 << PFX_REP))
 				it->modrm_access_type = ACCESS_R;
 			else
 				it->modrm_access_type = ACCESS_W;
@@ -354,9 +334,9 @@ done_prefixes:
 		break;
 
 	case 0xb8 ... 0xbf: /* mov reg, Iz */
-		if (*prefixes & (1 << PFX_REX_W))
+		if (it->prefixes & (1 << PFX_REX_W))
 			it->bytes_immediate = 8;
-		else if (*prefixes & (1 << PFX_OPSIZE))
+		else if (it->prefixes & (1 << PFX_OPSIZE))
 			it->bytes_immediate = 2;
 		else
 			it->bytes_immediate = imm_opsize;
@@ -427,11 +407,10 @@ handle_instruction(const unsigned char *base,
 		   unsigned long mapped_at,
 		   struct loaded_object *lo)
 {
-	unsigned prefixes;
 	struct instr_template it;
-	find_instr_template(instr, mapped_at, &it, &prefixes);
+	find_instr_template(instr, mapped_at, &it);
 	if (it.modrm_access_type != ACCESS_INVALID)
-		modrm(instr, &it, mapped_at, lo, prefixes);
+		modrm(instr, &it, mapped_at, lo);
 	return instr_size(&it);
 }
 
@@ -468,7 +447,6 @@ fetch_reg_by_index(const struct user_regs_struct *urs, unsigned index)
 unsigned long
 eval_modrm_addr(const unsigned char *modrm_bytes,
 		const struct instr_template *it,
-		unsigned prefixes,
 		const struct user_regs_struct *urs)
 {
 	unsigned modrm = modrm_bytes[0];
@@ -493,7 +471,7 @@ eval_modrm_addr(const unsigned char *modrm_bytes,
 		index = (sib >> 3) & 7;
 		scale = 1 << (sib >> 6);
 
-		if (prefixes & (1 << PFX_REX_B))
+		if (it->prefixes & (1 << PFX_REX_B))
 			base |= 8;
 		if (base == 5 || base == 13) {
 			if (mod == 0) {
@@ -508,7 +486,7 @@ eval_modrm_addr(const unsigned char *modrm_bytes,
 		} else {
 			sibval = fetch_reg_by_index(urs, base);
 		}
-		if (prefixes & (1 << PFX_REX_X))
+		if (it->prefixes & (1 << PFX_REX_X))
 			index |= 8;
 		if (index != 4)
 			sibval += fetch_reg_by_index(urs, index) * scale;
@@ -520,7 +498,7 @@ eval_modrm_addr(const unsigned char *modrm_bytes,
 
 	reg = fetch_reg_by_index(
 		urs,
-		rm | (prefixes & (1 << PFX_REX_B) ? 8 : 0));
+		rm | (it->prefixes & (1 << PFX_REX_B) ? 8 : 0));
 
 	switch (mod) {
 	case 0:
@@ -534,6 +512,210 @@ eval_modrm_addr(const unsigned char *modrm_bytes,
 		return reg + *(int *)disp_bytes;
 	}
 	abort();
+}
+
+static void
+discover_function(struct loaded_object *lo,
+		  const char *name,
+		  unsigned long addr)
+{
+	struct function *f;
+	list_foreach(&lo->functions, f, list) {
+		if (f->head == addr)
+			return;
+	}
+	f = calloc(sizeof(*f), 1);
+	f->name = strdup(name);
+	f->head = addr;
+	list_push(f, list, &lo->functions);
+	printf("New function %s at %lx\n", name, addr);
+}
+
+static unsigned long
+instr_opcode(const struct instruction *i)
+{
+	if (i->template.bytes_opcode == 1)
+		return i->text[i->template.bytes_prefix];
+	else if (i->template.bytes_opcode == 2)
+		return ((unsigned long)i->text[i->template.bytes_prefix] << 8) |
+			i->text[i->template.bytes_prefix+1];
+	else
+		abort();
+}
+
+struct address_queue {
+	unsigned nr_queued;
+	unsigned nr_alloced;
+	unsigned long *content;
+};
+
+static unsigned long
+queue_pop(struct address_queue *q)
+{
+	unsigned long a;
+	a = q->content[q->nr_queued-1];
+	q->nr_queued--;
+	return a;
+}
+
+static void
+queue_push(struct address_queue *q, unsigned long a)
+{
+	if (q->nr_queued == q->nr_alloced) {
+		q->nr_alloced += 32;
+		q->content = realloc(q->content, sizeof(q->content[0]) * q->nr_alloced);
+	}
+	q->content[q->nr_queued] = a;
+	q->nr_queued++;
+}
+
+static bool
+queue_empty(const struct address_queue *q)
+{
+	return q->nr_queued == 0;
+}
+
+static bool
+addr_known(const struct partial_cfg *pc, unsigned long addr)
+{
+	const struct instruction *i;
+	list_foreach(&pc->instructions, i, list)
+		if (i->addr == addr)
+			return true;
+	return false;
+}
+
+static struct partial_cfg *
+build_cfg_from(unsigned long addr, unsigned long map_delta)
+{
+	struct partial_cfg *work;
+	struct address_queue queue = {0};
+	struct instruction *i;
+	unsigned long branch_target;
+	void *immediate;
+
+	work = calloc(sizeof(*work), 1);
+	init_list_head(&work->instructions);
+
+	printf("Investigating function at %lx...\n", addr);
+
+	/* First, discover all of the possibly-relevant instructions */
+	queue_push(&queue, addr);
+	while (!queue_empty(&queue)) {
+		addr = queue_pop(&queue);
+		if (addr_known(work, addr))
+			continue;
+		printf("New instruction at %lx\n", addr);
+		i = calloc(sizeof(*i), 1);
+		list_push(i, list, &work->instructions);
+		i->addr = addr;
+		find_instr_template( (const void *)(addr + map_delta),
+				     addr,
+				     &i->template);
+		memcpy(i->text, (const void *)(addr + map_delta),
+		       instr_size(&i->template));
+
+		i->next.a = addr + instr_size(&i->template);
+		branch_target = i->next.a;
+		immediate = i->text + i->template.bytes_prefix + i->template.bytes_opcode + i->template.bytes_modrm;
+		if (i->template.bytes_immediate == 1)
+			branch_target += *(char *)immediate;
+		else if (i->template.bytes_immediate == 2)
+			branch_target += *(short *)immediate;
+		else if (i->template.bytes_immediate == 4)
+			branch_target += *(int *)immediate;
+		else if (i->template.bytes_immediate == 8)
+			branch_target += *(long *)immediate;
+		else {
+			assert(i->template.bytes_immediate == 0);
+		}
+
+		switch (instr_opcode(i)) {
+			/* 2-exit instructions where the delta is
+			   encoded as an immediate value. */
+		case 0x70 ... 0x7f: /* jcc */
+		case 0x0f80 ... 0x0f8f: /* jcc */
+		case 0xe0: case 0xe1: /* loopcc */
+		case 0xe3: /* jcxz */
+			i->branch.a = branch_target;
+			break;
+
+			/* 0-exit instructions */
+		case 0xc2: case 0xc3: /* ret near */
+		case 0xca: case 0xcb: /* ret far */
+		case 0xcc: /* int3 */
+		case 0xcf: /* iret */
+		case 0xf1: /* int1 */
+		case 0xf4: /* hlt */
+		case 0x0f0b: /* ud2 */
+			i->next.a = 0;
+			break;
+
+			/* 1-exit instructions which don't fall
+			   through.  Target is assumed to be encoded
+			   as an immediate value. */
+		case 0xe2: /* loop */
+		case 0xe9: /* Jmp Jz */
+		case 0xeb: /* Jmp Jb */
+			i->next.a = 0;
+			i->branch.a = branch_target;
+			break;
+
+		case 0xff: { /* Group 5 */
+			unsigned char modrm = i->text[i->template.bytes_prefix + i->template.bytes_modrm];
+			unsigned reg = (modrm >> 3) & 7;
+			switch (reg) {
+			case 0: /* inc */
+			case 1: /* dec */
+			case 2: /* Call Ev, treat as normal instruction */
+			case 3: /* Call Mp, treat as normal instruction */
+				break;
+			case 4: /* jmp Ev, treat as 0-exit */
+			case 5: /* jmp Mp, treat as 0-exit */
+				i->next.a = 0;
+				break;
+			case 6: /* push ev */
+				break;
+			case 7: /* Reserved */
+				abort();
+			}
+			break;
+		}
+
+			/* Other abnormal-exit instructions.  We
+			   pretty much just pretend that these are
+			   normal at this stage. */
+		case 0x0f05: /* syscall */
+		case 0x9a: /* call */
+		case 0xcd: /* int n */
+		case 0xe8: /* call */
+			break;
+
+			/* Normal single-exit instructions */
+		default:
+			break;
+		}
+
+		if (i->next.a)
+			queue_push(&queue, i->next.a);
+		if (i->branch.a)
+			queue_push(&queue, i->branch.a);
+	}
+}
+
+static void
+explore_function(struct loaded_object *lo, struct function *f,
+		 unsigned long map_delta)
+{
+	struct partial_cfg *cfg = build_cfg_from(f->head, map_delta);
+}
+
+static void
+explore_functions(struct loaded_object *lo, unsigned long map_delta)
+{
+	struct function *f;
+	list_foreach(&lo->functions, f, list)
+		explore_function(lo, f, map_delta);
 }
 
 struct loaded_object *
@@ -563,6 +745,7 @@ process_shlib(struct process *p, unsigned long start_vaddr,
 	msg(15, "Processing %s at %lx\n", fname, start_vaddr - offset);
 	lo = calloc(sizeof(*lo), 1);
 	init_list_head(&lo->breakpoints);
+	init_list_head(&lo->functions);
 	lo->name = strdup(fname);
 	lo->nr_instrs_alloced = 128;
 	lo->nr_instrs = 0;
@@ -603,6 +786,45 @@ process_shlib(struct process *p, unsigned long start_vaddr,
 	else
 		shstrtab = (void *)hdr + shdrs[hdr->e_shstrndx].sh_offset;
 
+	/* First, parse up the symbol tables to find functions */
+	for (x = 0; x < nr_shdrs; x++) {
+		const Elf64_Shdr *str_shdr;
+		const Elf64_Sym *symbols;
+		const void *symstrtab;
+		unsigned idx;
+
+		if (shdrs[x].sh_type != SHT_SYMTAB &&
+		    shdrs[x].sh_type != SHT_DYNSYM)
+			continue;
+		printf("Symbol table in slot %d, link %d, info %d\n",
+		       x, shdrs[x].sh_link, shdrs[x].sh_info);
+		str_shdr = NULL;
+		if (shdrs[x].sh_link != 0 && shdrs[x].sh_link < nr_shdrs)
+			str_shdr = &shdrs[shdrs[x].sh_link];
+		symbols = (const Elf64_Sym *)
+			((unsigned long)hdr +
+			 shdrs[x].sh_offset);
+		symstrtab = (const void *)hdr + str_shdr->sh_offset;
+		for (idx = 0;
+		     idx < shdrs[x].sh_size / sizeof(symbols[0]);
+		     idx++) {
+			if (ELF64_ST_TYPE(symbols[idx].st_info) != STT_FUNC)
+				continue;
+			if (symbols[idx].st_shndx == 0 ||
+			    symbols[idx].st_shndx > nr_shdrs)
+				continue;
+			discover_function(lo,
+					  symstrtab + symbols[idx].st_name,
+					  symbols[idx].st_value);
+		}
+	}
+
+	/* Make sure that we explore the main entry point */
+	discover_function(lo, "<entrypoint>", hdr->e_entry);
+
+	explore_functions(lo, (unsigned long)hdr - start_vaddr);
+
+#if 0
 	for (x = 0; x < nr_shdrs; x++) {
 		if (shdrs[x].sh_type != SHT_PROGBITS ||
 		    !(shdrs[x].sh_flags & SHF_ALLOC) ||
@@ -618,6 +840,7 @@ process_shlib(struct process *p, unsigned long start_vaddr,
 				lo);
 		}
 	}
+#endif
 
 	munmap((void *)hdr, s);
 

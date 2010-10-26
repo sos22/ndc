@@ -245,7 +245,6 @@ memory_access_breakpoint(struct thread *p, struct breakpoint *bp, void *ctxt,
 			 struct user_regs_struct *urs)
 {
 	unsigned char instr[16];
-	unsigned prefixes;
 	struct instr_template it;
 	unsigned long modrm_addr;
 	struct watchpoint *wp;
@@ -277,12 +276,11 @@ memory_access_breakpoint(struct thread *p, struct breakpoint *bp, void *ctxt,
 	(void)_fetch_bytes(p, urs->rip, instr, sizeof(instr));
 
 	/* Find out what memory location it's accessing. */
-	find_instr_template(instr, urs->rip, &it, &prefixes);
+	find_instr_template(instr, urs->rip, &it);
 	assert(it.modrm_access_type != ACCESS_INVALID &&
 	       it.modrm_access_type != ACCESS_NONE);
 	modrm_addr = eval_modrm_addr(instr + it.bytes_prefix + it.bytes_opcode,
 				     &it,
-				     prefixes,
 				     urs);
 
 	nr_evals++;
@@ -371,6 +369,12 @@ unloaded_object(struct thread *thr, struct loaded_object *lo)
 	msg(50, "Unloaded %s\n", lo->name);
 
 	clear_all_breakpoints(thr, lo);
+	while (!list_empty(&lo->functions)) {
+		struct function *f = list_pop(struct function, list, &lo->functions);
+		free(f->name);
+		free(f);
+
+	}
 
 	list_unlink(&lo->list);
 	free(lo->name);

@@ -1,4 +1,4 @@
-CFLAGS+=-Wall -g
+CPPFLAGS+=-Wall -g
 
 all: ndc.so test_dlopen test.so test_race1 ndc
 
