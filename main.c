@@ -35,6 +35,10 @@ static bool writes_sufficient = true; /* Only set breakpoints on
 					 watchpoints for reads */
 static const char *target_binary;
 
+static bool do_stats;
+static unsigned long nr_evals;
+static unsigned long nr_stack_evals;
+
 #define PRELOAD_LIB_NAME "/local/scratch/sos22/notdc/ndc.so"
 #define PTRACE_OPTIONS (PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC | PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK | PTRACE_O_TRACEEXEC)
 
@@ -267,6 +271,10 @@ memory_access_breakpoint(struct thread *p, struct breakpoint *bp, void *ctxt,
 				     &it,
 				     prefixes,
 				     urs);
+
+	nr_evals++;
+	if (modrm_addr >= urs->rsp - 128 && modrm_addr < urs->rsp + 4096)
+		nr_stack_evals++;
 
 	if (it.modrm_access_type == ACCESS_R)
 		wp = set_watchpoint(p->process, modrm_addr, 8, 0);
@@ -623,6 +631,8 @@ static struct argp_option argp_options[] = {
 	  .key = 'x' },
 	{ .name = "break-on-read",
 	  .key = 'b' },
+	{ .name = "stats",
+	  .key = 's' },
 	{ 0 }
 };
 
@@ -644,6 +654,9 @@ argp_parser(int key, char *arg, struct argp_state *state)
 		return 0;
 	case 'b':
 		writes_sufficient = false;
+		return 0;
+	case 's':
+		do_stats = true;
 		return 0;
 	default:
 		return ARGP_ERR_UNKNOWN;
@@ -734,6 +747,9 @@ main(int argc, char *argv[])
 
 			if (status == -1)
 				unpause_child(child->head_thread);
+
+			if (do_stats)
+				printf("Stack ratio %f\n", (double)nr_stack_evals/nr_evals);
 		}
 
 		for (thr = child->head_thread; thr && !thr_is_stopped(thr); thr = thr->next)
