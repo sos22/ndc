@@ -553,25 +553,23 @@ process_shlib(struct process *p, unsigned long start_vaddr,
 	const void *end_instr;
 	unsigned x;
 
-	for (lo = p->head_loaded_object; lo && strcmp(lo->name, fname); lo = lo->next)
-		;
-	if (lo) {
-		lo->live = true;
-		return lo;
+	list_foreach(&p->loaded_objects, lo, list) {
+		if (!strcmp(lo->name, fname)) {
+			lo->live = true;
+			return lo;
+		}
 	}
 
 	msg(15, "Processing %s at %lx\n", fname, start_vaddr - offset);
 	lo = calloc(sizeof(*lo), 1);
+	init_list_head(&lo->breakpoints);
 	lo->name = strdup(fname);
 	lo->nr_instrs_alloced = 128;
 	lo->nr_instrs = 0;
 	lo->next_instr_to_set_bp_on = random();
 	lo->instrs = calloc(sizeof(lo->instrs[0]), lo->nr_instrs_alloced);
-	lo->next = p->head_loaded_object;
 	lo->live = true;
-	if (p->head_loaded_object)
-		p->head_loaded_object->prev = lo;
-	p->head_loaded_object = lo;
+	list_push(lo, list, &p->loaded_objects);
 
 	fd = open(fname, O_RDONLY);
 	if (fd < 0)

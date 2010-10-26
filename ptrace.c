@@ -26,8 +26,6 @@
 
 #include "ndc.h"
 
-#define offsetof(field, strct) ((unsigned long)&((strct *)0)->field)
-
 static unsigned long
 fetch_ulong(struct thread *thr, unsigned long addr)
 {
@@ -122,10 +120,8 @@ set_breakpoint(struct thread *thr,
 	bp->f = f;
 	bp->ctxt = ctxt;
 	bp->lo = lo;
-	bp->next = thr->process->head_breakpoint;
-	if (thr->process->head_breakpoint)
-		thr->process->head_breakpoint->prev = bp;
-	thr->process->head_breakpoint = bp;
+	init_list_entry(&bp->list_loaded_object);
+	list_push(bp, list_process, &thr->process->breakpoints);
 
 	bp->old_content = fetch_byte(thr, addr);
 	store_byte(thr, addr, 0xcc);
@@ -137,22 +133,10 @@ void
 unset_breakpoint(struct thread *thr, struct breakpoint *bp)
 {
 	store_byte(thr, bp->addr, bp->old_content);
-	if (bp->next)
-		bp->next->prev = bp->prev;
-	if (bp->prev)
-		bp->prev->next = bp->next;
-	else
-		thr->process->head_breakpoint = bp->next;
+	list_unlink(&bp->list_process);
+	list_unlink(&bp->list_loaded_object);
 
 	if (bp->lo) {
-		if (bp == bp->lo->head_bp) {
-			assert(!bp->prev_lo);
-			bp->lo->head_bp = bp->next_lo;
-		} else if (bp->prev_lo) {
-			bp->prev_lo->next_lo = bp->next_lo;
-		}
-		if (bp->next_lo)
-			bp->next_lo->prev_lo = bp->prev_lo;
 		assert(bp->lo->nr_breakpoints);
 		bp->lo->nr_breakpoints--;
 	}
@@ -164,9 +148,10 @@ static struct thread *
 find_thread_by_pid(struct process *p, pid_t pid)
 {
 	struct thread *thr;
-	for (thr = p->head_thread; thr && thr->pid != pid; thr = thr->next)
-		;
-	return thr;
+	list_foreach(&p->threads, thr, list)
+		if (thr->pid == pid)
+			return thr;
+	return NULL;
 }
 
 static bool
@@ -300,7 +285,7 @@ set_watchpoint(struct process *p, unsigned long addr, unsigned size, int watch_r
 		abort();
 	}
 
-	for (thr = p->head_thread; thr; thr = thr->next) {
+	list_foreach(&p->threads, thr, list) {
 		running = !thr_is_stopped(thr);
 		if (running)
 			while (!pause_child(thr))
@@ -308,11 +293,11 @@ set_watchpoint(struct process *p, unsigned long addr, unsigned size, int watch_r
 		assert(thr_is_stopped(thr));
 
 		if (ptrace(PTRACE_POKEUSER, thr->pid,
-			   offsetof(u_debugreg[0], struct user),
+			   offsetof(struct user, u_debugreg[0]),
 			   addr) < 0)
 			err(1, "Setting debug register 0 of %d", thr->pid);
 		if (ptrace(PTRACE_POKEUSER, thr->pid,
-			   offsetof(u_debugreg[7], struct user),
+			   offsetof(struct user, u_debugreg[7]),
 			   (size << 18) |
 			   ((watch_reads ? 3 : 1) << 16) |
 			   1) < 0)
@@ -333,7 +318,7 @@ unset_watchpoint(struct watchpoint *w)
 	struct thread *thr;
 	bool running;
 
-	for (thr = p->head_thread; thr; thr = thr->next) {
+	list_foreach(&p->threads, thr, list) {
 		running = !thr_is_stopped(thr);
 
 		if (running)
@@ -341,7 +326,7 @@ unset_watchpoint(struct watchpoint *w)
 				;
 
 		if (ptrace(PTRACE_POKEUSER, thr->pid,
-			   offsetof(u_debugreg[7], struct user),
+			   offsetof(struct user, u_debugreg[7]),
 			   0) < 0)
 			err(1, "Clearing debug register 7 of %d", thr->pid);
 		if (running)
@@ -430,7 +415,7 @@ handle_breakpoint(struct thread *thr)
 
 	get_regs(thr, &urs);
 	urs.rip -= 1;
-	for (bp = thr->process->head_breakpoint; bp; bp = bp->next) {
+	list_foreach(&thr->process->breakpoints, bp, list_process) {
 		if (bp->addr == urs.rip) {
 			bp->f(thr, bp, bp->ctxt, &urs);
 			resume_child(thr);

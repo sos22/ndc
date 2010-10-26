@@ -7,8 +7,104 @@ struct thread;
 struct loaded_object;
 struct watchpoint;
 
+#define offsetof(type, field)			        \
+(unsigned long)&((type *)0)->field
+
+#define container_of(strct, type, field)		\
+(type *)((unsigned long)strct - offsetof(type, field))
+
+struct list_entry {
+	struct list_entry *next, *prev;
+};
+
+struct list_head {
+	struct list_entry content;
+};
+
+static inline void
+init_list_entry(struct list_entry *le)
+{
+	le->next = le->prev = le;
+}
+
+static inline void
+init_list_head(struct list_head *le)
+{
+	le->content.next = &le->content;
+	le->content.prev = &le->content;
+}
+
+static inline bool
+list_empty(const struct list_head *lh)
+{
+	return lh->content.next == &lh->content;
+}
+
+static inline void
+list_unlink(struct list_entry *le)
+{
+	le->next->prev = le->prev;
+	le->prev->next = le->next;
+	le->next = le;
+	le->prev = le;
+}
+
+static inline struct list_entry *
+_list_pop(struct list_head *lh)
+{
+	struct list_entry *l = lh->content.next;
+	assert(!list_empty(lh));
+	list_unlink(l);
+	return l;
+}
+
+static inline void
+_list_push(struct list_head *lh, struct list_entry *what)
+{
+	what->next = &lh->content;
+	what->prev = lh->content.prev;
+	what->next->prev = what;
+	what->prev->next = what;
+}
+
+#define list_foreach(lh, cursor, field)		                \
+	for (cursor = container_of((lh)->content.next,		\
+				   typeof(*cursor),		\
+				   field);			\
+	     cursor != container_of(&(lh)->content,		\
+				    typeof(*cursor),		\
+				    field);			\
+	     cursor = container_of(cursor->field.next,		\
+				   typeof(*cursor),		\
+				   field))
+#define list_foreach_careful(lh, cursor, field, nxt)		\
+	for (cursor = container_of((lh)->content.next,		\
+				   typeof(*cursor),		\
+				   field),			\
+		     nxt = container_of(cursor->field.next,	\
+					 typeof(*cursor),	\
+					 field);		\
+	     cursor != container_of(&(lh)->content,		\
+				    typeof(*cursor),		\
+				    field);			\
+	     cursor = nxt,					\
+		     nxt = container_of(cursor->field.next,	\
+					typeof(*cursor),	\
+					field))
+
+#define list_first(lh, type, field)			        \
+	({							\
+		assert(!list_empty(lh));			\
+		container_of((lh)->content.next, type, field);	\
+	})
+
+#define list_pop(typ, field, head)			\
+	container_of(_list_pop(head), typ, field)
+#define list_push(what, field, head)		        \
+	_list_push( (head), &(what)->field)
+
 struct thread {
-	struct thread *next, *prev;
+	struct list_entry list;
 	struct process *process;
 	pid_t pid;
 
@@ -17,9 +113,9 @@ struct thread {
 };
 
 struct loaded_object {
-	struct loaded_object *next;
-	struct loaded_object *prev;
-	struct breakpoint *head_bp;
+	struct list_entry list;
+	struct list_head breakpoints;
+
 	char *name;
 	bool live;
 
@@ -33,11 +129,8 @@ struct loaded_object {
 };
 
 struct breakpoint {
-	struct breakpoint *next;
-	struct breakpoint *prev;
-
-	struct breakpoint *next_lo;
-	struct breakpoint *prev_lo;
+	struct list_entry list_process;
+	struct list_entry list_loaded_object;
 
 	struct loaded_object *lo;
 
@@ -61,7 +154,8 @@ struct pending_wait_status {
 };
 
 struct process {
-	struct thread *head_thread;
+	struct list_head threads;
+
 	int from_child_fd;
 	int to_child_fd;
 	unsigned long linker_brk_addr;
@@ -71,8 +165,8 @@ struct process {
 	pid_t timeout_pid;
 	bool timeout_fired;
 
-	struct breakpoint *head_breakpoint;
-	struct loaded_object *head_loaded_object;
+	struct list_head breakpoints;
+	struct list_head loaded_objects;
 
 	struct pending_wait_status pws;
 };

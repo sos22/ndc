@@ -78,9 +78,10 @@ static void
 kill_child(int ign, void *_child)
 {
 	struct process *child = _child;
-	while (child->head_thread) {
-		tgkill(child->tgid, child->head_thread->pid, SIGKILL);
-		child->head_thread = child->head_thread->next;
+	struct thread *thr;
+	while (!list_empty(&child->threads)) {
+		thr = list_pop(struct thread, list, &child->threads);
+		tgkill(child->tgid, thr->pid, SIGKILL);
 	}
 }
 
@@ -92,11 +93,16 @@ spawn_child(const char *path, char *const argv[])
 	int p1[2], p2[2];
 
 	work = calloc(sizeof(*work), 1);
+	init_list_head(&work->threads);
+	init_list_head(&work->breakpoints);
+	init_list_head(&work->loaded_objects);
+
 	thr = calloc(sizeof(*thr), 1);
-	work->head_thread = thr;
-	work->nr_threads = 1;
 	thr->process = work;
 	thr->_stop_status = -1;
+
+	list_push(thr, list, &work->threads);
+	work->nr_threads = 1;
 	if (pipe(p1) < 0 || pipe(p2) < 0)
 		err(1, "pipe()");
 	work->tgid = thr->pid = fork();
@@ -195,8 +201,12 @@ itimer_handler(int ignore)
 static void
 clear_all_breakpoints(struct thread *thr, struct loaded_object *lo)
 {
-	while (lo->head_bp)
-		unset_breakpoint(thr, lo->head_bp);
+	struct breakpoint *bp;
+
+	while (!list_empty(&lo->breakpoints)) {
+		bp = list_pop(struct breakpoint, list_loaded_object, &lo->breakpoints);
+		unset_breakpoint(thr, bp);
+	}
 }
 
 static void
@@ -206,6 +216,7 @@ install_breakpoints(struct thread *thr, struct loaded_object *lo)
 	struct breakpoint *bp;
 	unsigned x;
 	unsigned long addr;
+	bool found_it;
 
 	target_nr_breakpoints = lo->nr_instrs / target_breakpoint_ratio;
 
@@ -213,15 +224,17 @@ install_breakpoints(struct thread *thr, struct loaded_object *lo)
 	while (lo->nr_breakpoints < target_nr_breakpoints) {
 		x = lo->next_instr_to_set_bp_on++ % lo->nr_instrs;
 		addr = lo->instrs[x];
-		for (bp = lo->head_bp; bp && bp->addr != addr; bp = bp->next_lo)
-			;
-		if (bp)
+		found_it = false;
+		list_foreach(&lo->breakpoints, bp, list_loaded_object) {
+			if (bp->addr == addr) {
+				found_it = true;
+				break;
+			}
+		}
+		if (found_it)
 			continue;
 		bp = set_breakpoint(thr, lo->instrs[x], lo, memory_access_breakpoint, lo);
-		if (lo->head_bp)
-			lo->head_bp->prev_lo = bp;
-		bp->next_lo = lo->head_bp;
-		lo->head_bp = bp;
+		list_push(bp, list_loaded_object, &lo->breakpoints);
 		lo->nr_breakpoints++;
 	}
 	sanity_check_lo(lo);
@@ -296,9 +309,7 @@ memory_access_breakpoint(struct thread *p, struct breakpoint *bp, void *ctxt,
 		   between the test of timer_fired and the wait
 		   syscall we'll deadlock! */
 		receive_ptrace_event(p->process);
-		for (other = p->process->head_thread;
-		     other;
-		     other = other->next) {
+		list_foreach(&p->process->threads, other, list) {
 			if (other == p)
 				continue;
 			if (!thr_is_stopped(other)) {
@@ -359,17 +370,9 @@ unloaded_object(struct thread *thr, struct loaded_object *lo)
 {
 	msg(50, "Unloaded %s\n", lo->name);
 
-	while (lo->head_bp)
-		unset_breakpoint(thr, lo->head_bp);
+	clear_all_breakpoints(thr, lo);
 
-	if (lo->next)
-		lo->next->prev = lo->prev;
-	if (lo->prev) {
-		lo->prev->next = lo->next;
-	} else {
-		assert(thr->process->head_loaded_object == lo);
-		thr->process->head_loaded_object = lo->next;
-	}
+	list_unlink(&lo->list);
 	free(lo->name);
 	free(lo->instrs);
 	free(lo);
@@ -382,9 +385,10 @@ linker_did_something(struct thread *thr, struct breakpoint *_ign1, void *_ign2,
 	FILE *f;
 	char *path;
 	struct loaded_object *lo;
+	struct loaded_object *next_lo;
 	struct process *p = thr->process;
 
-	for (lo = p->head_loaded_object; lo; lo = lo->next)
+	list_foreach(&p->loaded_objects, lo, list)
 		lo->live = false;
 
 	asprintf(&path, "/proc/%d/maps", thr->pid);
@@ -441,33 +445,19 @@ linker_did_something(struct thread *thr, struct breakpoint *_ign1, void *_ign2,
 					       fname,
 					       lo->nr_instrs,
 					       target_breakpoint_ratio);
-				install_breakpoints(p->head_thread, lo);
+				install_breakpoints(list_first(&p->threads, struct thread, list), lo);
 			}
 		}
 
 		free(fname);
 	}
 
-	while (p->head_loaded_object &&
-	       !p->head_loaded_object->live) {
-		struct loaded_object *next = p->head_loaded_object->next;
-		unloaded_object(thr, p->head_loaded_object);
-		p->head_loaded_object = next;
-	}
-	if (p->head_loaded_object) {
-		struct loaded_object *next;
-		for (lo = p->head_loaded_object;
-		     lo->next;
-		     lo = next) {
-			if (!lo->next->live) {
-				next = lo->next->next;
-				unloaded_object(thr, lo->next);
-				lo->next = next;
-				next = lo;
-			} else {
-				next = lo->next;
-			}
-		}
+	list_foreach_careful(&p->loaded_objects,
+			     lo,
+			     list,
+			     next_lo) {
+		if (!lo->live)
+			unloaded_object(thr, lo);
 	}
 
 	fclose(f);
@@ -520,10 +510,7 @@ handle_clone(struct thread *parent)
 		err(1, "ptrace(PTRACE_SETOPTIONS) for new thread");
 
 	/* Enlist the new thread in the process */
-	thr->next = parent->process->head_thread;
-	if (parent->process->head_thread)
-		parent->process->head_thread->prev = thr;
-	parent->process->head_thread = thr;
+	list_push(thr, list, &parent->process->threads);
 	parent->process->nr_threads++;
 
 	/* And let them both go */
@@ -552,7 +539,7 @@ handle_fork(struct thread *thr)
 	 * to pass to store_byte */
 	bzero(&new_thr, sizeof(new_thr));
 	new_thr.pid = new_pid;
-	for (bp = thr->process->head_breakpoint; bp; bp = bp->next)
+	list_foreach(&thr->process->breakpoints, bp, list_process)
 		store_byte(&new_thr, bp->addr, bp->old_content);
 
 	/* Detach it and let it go */
@@ -566,15 +553,12 @@ static void
 thread_exited(struct thread *thr, int status)
 {
 	msg(50, "Thread %d exited\n", thr->pid);
-	if (thr->next)
-		thr->next->prev = thr->prev;
-	if (thr->prev)
-		thr->prev->next = thr->next;
-	else
-		thr->process->head_thread = thr->next;
+	list_unlink(&thr->list);
 	thr->process->nr_threads--;
-	if (thr->process->nr_threads == 0)
+	if (thr->process->nr_threads == 0) {
+		assert(list_empty(&thr->process->threads));
 		exit(status);
+	}
 	free(thr);
 }
 
@@ -672,6 +656,7 @@ int
 main(int argc, char *argv[])
 {
 	struct process *child;
+	struct thread *head_thr;
 	int r;
 	struct sigaction timer_sa;
 	int arg_index;
@@ -693,21 +678,22 @@ main(int argc, char *argv[])
 	target_binary = basename(argv[arg_index]);
 
 	child = spawn_child(argv[arg_index], argv + arg_index);
+	assert(child->nr_threads == 1);
+	head_thr = list_first(&child->threads, struct thread, list);
 
 	/* Child starts stopped. */
-	assert(child->nr_threads == 1);
-	resume_child(child->head_thread);
+	resume_child(head_thr);
 
 	/* Get the break address */
 	r = read(child->from_child_fd, &child->linker_brk_addr,
 		 sizeof(child->linker_brk_addr));
 	if (r != sizeof(child->linker_brk_addr))
 		err(1, "reading child's linker break address");
-	pause_child(child->head_thread);
-	set_breakpoint(child->head_thread, child->linker_brk_addr, NULL,
+	pause_child(head_thr);
+	set_breakpoint(head_thr, child->linker_brk_addr, NULL,
 		       linker_did_something, NULL);
-	linker_did_something(child->head_thread, NULL, NULL, NULL);
-	resume_child(child->head_thread);
+	linker_did_something(head_thr, NULL, NULL, NULL);
+	resume_child(head_thr);
 
 	/* Close out our file descriptors to set it going properly. */
 	close(child->from_child_fd);
@@ -724,6 +710,7 @@ main(int argc, char *argv[])
 
 	while (1) {
 		struct thread *thr;
+		bool nothing_ready;
 
 		if (child->timeout_fired) {
 			int status;
@@ -736,28 +723,36 @@ main(int argc, char *argv[])
 				_exit(0);
 			}
 
-			status = child->head_thread->_stop_status;
+			head_thr = list_first(&child->threads, struct thread, list);
+			status = head_thr->_stop_status;
 			if (status == -1)
-				pause_child(child->head_thread);
+				pause_child(head_thr);
 
-			for (lo = child->head_loaded_object; lo; lo = lo->next) {
-				clear_all_breakpoints(child->head_thread, lo);
-				install_breakpoints(child->head_thread, lo);
+			list_foreach(&child->loaded_objects, lo, list) {
+				clear_all_breakpoints(head_thr, lo);
+				install_breakpoints(head_thr, lo);
 			}
 
 			if (status == -1)
-				unpause_child(child->head_thread);
+				unpause_child(head_thr);
 
 			if (do_stats)
 				printf("Stack ratio %f\n", (double)nr_stack_evals/nr_evals);
 		}
 
-		for (thr = child->head_thread; thr && !thr_is_stopped(thr); thr = thr->next)
-			;
-		if (!thr) {
+		nothing_ready = true;
+		list_foreach(&child->threads, thr, list) {
+			if (thr_is_stopped(thr)) {
+				nothing_ready = false;
+				break;
+			}
+		}
+		if (nothing_ready) {
 			receive_ptrace_event(child);
 			continue;
 		}
+
+		assert(thr_is_stopped(thr));
 
 		if (WIFEXITED(thr_stop_status(thr))) {
 			msg(15, "Child exited with status %d, doing the same thing (%x)\n",

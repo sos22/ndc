@@ -16,21 +16,19 @@
 
 #ifndef NDEBUG
 static void
+sanity_check_list_entry(const struct list_entry *le)
+{
+	assert(le->prev);
+	assert(le->next);
+	assert(le->next->prev == le);
+	assert(le->prev->next == le);
+}
+
+static void
 sanity_check_bp(const struct breakpoint *bp)
 {
-	if (bp->next)
-		assert(bp->next->prev == bp);
-	if (bp->prev)
-		assert(bp->prev->next == bp);
-	if (bp->next_lo) {
-		assert(bp->next_lo->prev_lo == bp);
-		assert(bp->lo);
-	}
-	if (bp->prev_lo) {
-		assert(bp->prev_lo->next_lo == bp);
-		assert(bp->lo);
-	} else if (bp->lo)
-		assert(bp->lo->head_bp == bp);
+	sanity_check_list_entry(&bp->list_process);
+	sanity_check_list_entry(&bp->list_loaded_object);
 }
 
 void
@@ -39,7 +37,7 @@ sanity_check_lo(const struct loaded_object *lo)
 	const struct breakpoint *bp;
 	assert(lo->name);
 	assert(strlen(lo->name));
-	for (bp = lo->head_bp; bp; bp = bp->next_lo) {
+	list_foreach(&lo->breakpoints, bp, list_loaded_object) {
 		assert(bp->lo == lo);
 		sanity_check_bp(bp);
 	}
