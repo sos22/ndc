@@ -20,26 +20,70 @@ instr_size(const struct instr_template *it)
 	return it->bytes_prefix + it->bytes_opcode + it->bytes_modrm + it->bytes_immediate;
 }
 
+/* Assume that we're executing an instruction and the registers in the
+   mask @stack_registers_on_entry currently contain pointers into the
+   stack.  Does the modrm of this instruction point at the stack?
+   Returns true if it definitely does, or false if it might not. */
+static bool
+modrm_points_at_stack(const unsigned char *text,
+		      const struct instr_template *it,
+		      unsigned long stack_registers_on_entry)
+{
+	/* This moderately messy */
+	unsigned char modrm = text[it->bytes_prefix + it->bytes_opcode];
+	unsigned char mod = modrm >> 6;
+	unsigned char rm = modrm & 7;
+	bool is_stack;
+	unsigned modrm_mrm_reg;
+
+	assert(mod != 3);
+
+	modrm_mrm_reg = modrm & 7;
+	if (it->prefixes & (1 << PFX_REX_R))
+		modrm_mrm_reg |= 8;
+
+	if (rm == 4) {
+		unsigned char sib = text[it->bytes_prefix + it->bytes_opcode + 1];
+		unsigned base = sib & 7;
+		unsigned index = (sib >> 3) & 7;
+		unsigned scale = sib >> 6;
+
+		if (mod == 0 && base == 5) {
+			is_stack = false;
+		} else {
+			if (it->prefixes & (1 << PFX_REX_B))
+				base |= 8;
+			is_stack = !!(stack_registers_on_entry & (1 << base));
+		}
+		if (it->prefixes & (1 << PFX_REX_X))
+			index |= 8;
+		if (!is_stack && scale == 0 && (index != 4)) {
+			is_stack = !!(stack_registers_on_entry & (1 << index));
+		}
+	} else if (mod == 0 && rm == 5) {
+		is_stack = false;
+	} else {
+		is_stack = !!(stack_registers_on_entry & (1 << modrm_mrm_reg));
+	}
+	return is_stack;
+}
+
 static void
 modrm(const unsigned char *instr,
       struct instr_template *it,
       unsigned long mapped_at,
-      struct loaded_object *lo)
+      struct loaded_object *lo,
+      unsigned long stack_registers_on_entry)
 {
 	unsigned char modrm = instr[it->bytes_prefix + it->bytes_opcode];
-	unsigned rm = modrm & 7;
 	unsigned mod = modrm >> 6;
 	int interesting = it->modrm_access_type != ACCESS_NONE;
 
 	if (mod == 3) {
 		/* Register -> not interesting */
 		interesting = 0;
-	} else if (rm == 4 && !(it->prefixes & (1 << PFX_REX_B))) {
-		unsigned base = instr[it->bytes_prefix + it->bytes_opcode + 1] & 7;
-		if (base == 4) {
-			/* Stack access -> not interesting */
-			interesting = 0;
-		}
+	} else if (modrm_points_at_stack(instr, it, stack_registers_on_entry)) {
+		interesting = 0;
 	}
 
 	if (interesting)
@@ -401,19 +445,6 @@ done_decode:
 	}
 }
 
-static unsigned
-handle_instruction(const unsigned char *base,
-		   const unsigned char *instr,
-		   unsigned long mapped_at,
-		   struct loaded_object *lo)
-{
-	struct instr_template it;
-	find_instr_template(instr, mapped_at, &it);
-	if (it.modrm_access_type != ACCESS_INVALID)
-		modrm(instr, &it, mapped_at, lo);
-	return instr_size(&it);
-}
-
 static unsigned long
 fetch_reg_by_index(const struct user_regs_struct *urs, unsigned index)
 {
@@ -525,7 +556,8 @@ discover_function(struct loaded_object *lo,
 			return;
 	}
 	f = calloc(sizeof(*f), 1);
-	f->name = strdup(name);
+	if (name)
+		f->name = strdup(name);
 	f->head = addr;
 	list_push(f, list, &lo->functions);
 	printf("New function %s at %lx\n", name, addr);
@@ -585,14 +617,190 @@ addr_known(const struct partial_cfg *pc, unsigned long addr)
 	return false;
 }
 
+static struct instruction *
+find_instruction(struct partial_cfg *pc, unsigned long addr)
+{
+	struct instruction *i;
+	list_foreach(&pc->instructions, i, list)
+		if (i->addr == addr)
+			return i;
+	abort();
+}
+
+/* Assume that stack_registers_on_entry is set corerctly, and figure
+   out which registers will point at the stack after this
+   instruction. */
+static unsigned long
+compute_stack_registers_on_exit(struct instruction *i)
+{
+	unsigned long res = i->stack_registers_on_entry;
+	unsigned modrm_reg;
+	unsigned modrm_mrm_reg;
+	bool have_modrm_mrm_reg;
+
+	have_modrm_mrm_reg = false;
+	if (i->template.modrm_access_type != ACCESS_INVALID) {
+		unsigned char modrm = i->text[i->template.bytes_prefix + i->template.bytes_opcode];
+		modrm_reg = (modrm >> 3) & 7;
+		if (i->template.prefixes & (1 << PFX_REX_R))
+			modrm_reg |= 8;
+		if ((modrm >> 6) == 3) {
+			modrm_mrm_reg = modrm & 7;
+			if (i->template.prefixes & (1 << PFX_REX_R))
+				modrm_mrm_reg |= 8;
+			have_modrm_mrm_reg = true;
+		}
+	}
+
+	switch (instr_opcode(i)) {
+		/* Things which propagate stackness from one register
+		   to another */
+	case 1: /* add Ev, Gv */
+	case 0x29: /* sub Ev, Gv */
+		if (have_modrm_mrm_reg) {
+			if (res & (1 << modrm_reg))
+				res |= 1 << modrm_mrm_reg;
+		}
+		break;
+
+	case 3: /* add Gv, Ev */
+	case 0x2b: /* sub Gv, Ev */
+	case 0x8b: /* mov Gv, Ev */
+		res &= ~(1 << modrm_reg);
+		if (have_modrm_mrm_reg &&
+		    (res & (1 << modrm_mrm_reg)))
+			res |= 1 << modrm_reg;
+		break;
+
+	case 0x89: /* mov Ev, Gv */
+		if (have_modrm_mrm_reg) {
+			if (res & (1 << modrm_reg))
+				res |= 1 << modrm_mrm_reg;
+			else
+				res &= ~(1 << modrm_mrm_reg);
+		}
+		break;
+
+	case 0x8d: { /* lea Gv, M */
+		bool is_stack = modrm_points_at_stack(i->text, &i->template, i->stack_registers_on_entry);
+		if (is_stack)
+			res |= 1 << modrm_reg;
+		else
+			res &= ~(1 << modrm_reg);
+		break;
+	}
+
+		/* Now for instructions which unconditionally
+		 * un-stackify their target */
+
+	case 0x0fc0: /* xadd */
+	case 0x0fc1:
+		res &= ~(1 << modrm_reg);
+		if (have_modrm_mrm_reg)
+			res &= ~(1 << modrm_mrm_reg);
+		break;
+
+	case 0x0fa2: /* cpuid */
+		res &= ~0xf;
+		break;
+
+	case 0x90 ... 0x9f: { /* xchg reg, rax */
+		unsigned r = instr_opcode(i) & 7;
+		res &= ~1;
+		if (i->template.prefixes & (1 << PFX_REX_B))
+			r |= 8;
+		res &= ~(1 << r);
+		break;
+	}
+
+		/* cmpxchg */
+	case 0x0fb0:
+	case 0x0fb1:
+		res &= ~1;
+		if (have_modrm_mrm_reg)
+			res &= ~(1 << modrm_mrm_reg);
+		break;
+
+		/* syscalls */
+	case 0xcd: case 0x0f05:
+		res = 1 << 4;
+		break;
+
+		/* Target is E-type */
+	case 0x00: case 0x08: case 0x09: case 0x10: case 0x11:
+	case 0x18: case 0x19: case 0x20: case 0x21: case 0x28:
+	case 0x30: case 0x31: case 0x68:
+	case 0x80 ... 0x83: case 0x88:
+	case 0xc0: case 0xc1: case 0xc6: case 0xc7:
+	case 0xd0 ... 0xd3: case 0xf6: case 0xf7:
+	case 0x0f90 ... 0x0f9f: case 0x0fa4 ... 0x0fa5:
+	case 0x0fb3: case 0x0f7e: case 0x0fab ... 0x0fad:
+	case 0x0fbb: case 0x0fba: case 0x0fc6: case 0x0fc7:
+		if (have_modrm_mrm_reg)
+			res &= ~(1 << modrm_mrm_reg);
+		break;
+
+		/* Target G-type */
+	case 0x02: case 0x0a: case 0x0b: case 0x12: case 0x13: case 0x1a:
+	case 0x1b: case 0x22: case 0x23: case 0x2a:
+	case 0x32: case 0x33: case 0x69: case 0x6b:
+	case 0x8a: case 0x0f02: case 0x0f03: case 0x0f40 ... 0x0f4f:
+	case 0x0f50: case 0x0fb2: case 0x0fb4 ... 0x0fb7:
+	case 0x0fc5: case 0x0fd7: case 0x0faf: case 0x0fbc ... 0x0fbf:
+		res &= ~(1 << modrm_reg);
+		break;
+
+		/* Target both G and E type */
+	case 0x86: case 0x87:
+		res &= ~(1 << modrm_reg);
+		if (have_modrm_mrm_reg)
+			res &= ~(1 << modrm_mrm_reg);
+		break;
+
+		/* Target encoded in opcode */
+	case 0x58 ... 0x5f:
+	case 0xb0 ... 0xb7:
+	case 0xb8 ... 0xbf:
+	case 0x0fc8 ... 0x0fcf: {
+		unsigned r = instr_opcode(i) & 7;
+		if (i->template.prefixes & (1 << PFX_REX_B))
+			r |= 8;
+		res &= ~(1 << r);
+		break;
+	}
+
+		/* Target rcx */
+	case 0xa4 ... 0xa7: case 0xaa ... 0xaf:
+		res &= ~2;
+		break;
+
+		/* target rax */
+	case 0xa0 ... 0xa3: case 0xe4: case 0xe5:
+	case 0xec: case 0xed:
+		res &= ~1;
+		break;
+
+	default:
+		/* Anything else leaves the state alone */
+		break;
+	}
+
+	/* RSP always points at the stack */
+	res |= 1ul << 4;
+
+	return res;
+}
+
 static struct partial_cfg *
-build_cfg_from(unsigned long addr, unsigned long map_delta)
+build_cfg_from(struct loaded_object *lo, unsigned long addr, unsigned long map_delta)
 {
 	struct partial_cfg *work;
 	struct address_queue queue = {0};
 	struct instruction *i;
 	unsigned long branch_target;
 	void *immediate;
+	unsigned long head = addr;
+	bool converged;
 
 	work = calloc(sizeof(*work), 1);
 	init_list_head(&work->instructions);
@@ -605,7 +813,6 @@ build_cfg_from(unsigned long addr, unsigned long map_delta)
 		addr = queue_pop(&queue);
 		if (addr_known(work, addr))
 			continue;
-		printf("New instruction at %lx\n", addr);
 		i = calloc(sizeof(*i), 1);
 		list_push(i, list, &work->instructions);
 		i->addr = addr;
@@ -662,7 +869,7 @@ build_cfg_from(unsigned long addr, unsigned long map_delta)
 			break;
 
 		case 0xff: { /* Group 5 */
-			unsigned char modrm = i->text[i->template.bytes_prefix + i->template.bytes_modrm];
+			unsigned char modrm = i->text[i->template.bytes_prefix + i->template.bytes_opcode];
 			unsigned reg = (modrm >> 3) & 7;
 			switch (reg) {
 			case 0: /* inc */
@@ -682,13 +889,17 @@ build_cfg_from(unsigned long addr, unsigned long map_delta)
 			break;
 		}
 
+		case 0xe8: /* call.  Treated as a normal instruction,
+			      except that we discover a new entry
+			      point. */
+			discover_function(lo, NULL, branch_target);
+			break;
+
 			/* Other abnormal-exit instructions.  We
 			   pretty much just pretend that these are
 			   normal at this stage. */
 		case 0x0f05: /* syscall */
-		case 0x9a: /* call */
 		case 0xcd: /* int n */
-		case 0xe8: /* call */
 			break;
 
 			/* Normal single-exit instructions */
@@ -701,13 +912,83 @@ build_cfg_from(unsigned long addr, unsigned long map_delta)
 		if (i->branch.a)
 			queue_push(&queue, i->branch.a);
 	}
+
+	/* Now go and resolve all of those branches into appropriate
+	 * instruction structures */
+	list_foreach(&work->instructions, i, list) {
+		if (i->next.a)
+			i->next.i = find_instruction(work, i->next.a);
+		if (i->branch.a)
+			i->branch.i = find_instruction(work, i->branch.a);
+	}
+	work->head = find_instruction(work, head);
+
+	/* Now try to figure out which instructions are accessing the
+	   stack.  Those which actually use rsp are easy, but we also
+	   try to determine whether something is using the stack
+	   through some other register using a bit of static
+	   analysis. */
+	/* Aim here is to build, for each instruction, a set of
+	   registers which are definitely pointing at the stack at
+	   that instruction.  We start off assuming that every
+	   register always points at the stack, then mark the head so
+	   that only RSP is a stack pointer, and then fix up all the
+	   contradictions, iterating to a fixed point. */
+	list_foreach(&work->instructions, i, list) {
+		i->stack_registers_on_entry = ~0ul;
+	}
+	work->head->stack_registers_on_entry = 1ul << 4; /* Register 4 is
+							  * RSP in x86
+							  * encoding */
+
+	converged = false;
+	while (!converged) {
+		converged = true;
+		list_foreach(&work->instructions, i, list) {
+			unsigned long desired_mask =
+				compute_stack_registers_on_exit(i);
+			if (i->next.i &&
+			    (i->next.i->stack_registers_on_entry & ~desired_mask)) {
+				i->next.i->stack_registers_on_entry &=
+					desired_mask;
+				converged = false;
+			}
+			if (i->branch.i &&
+			    (i->branch.i->stack_registers_on_entry & ~desired_mask)) {
+				i->branch.i->stack_registers_on_entry &=
+					desired_mask;
+				converged = false;
+			}
+		}
+	}
+
+	/* Now, finally, walk the instruction list and decide whether
+	   they're candidates for breakpoints */
+	list_foreach(&work->instructions, i, list) {
+		if (i->template.modrm_access_type != ACCESS_INVALID)
+			modrm(i->text,
+			      &i->template,
+			      i->addr,
+			      lo,
+			      i->stack_registers_on_entry);
+	}
+
+	return work;
 }
 
 static void
 explore_function(struct loaded_object *lo, struct function *f,
 		 unsigned long map_delta)
 {
-	struct partial_cfg *cfg = build_cfg_from(f->head, map_delta);
+	struct partial_cfg *cfg = build_cfg_from(lo, f->head, map_delta);
+	struct instruction *i;
+
+	/* Only did that for the side effects... */
+	while (!list_empty(&cfg->instructions)) {
+		i = list_pop(struct instruction, list, &cfg->instructions);
+		free(i);
+	}
+	free(cfg);
 }
 
 static void
@@ -731,8 +1012,6 @@ process_shlib(struct process *p, unsigned long start_vaddr,
 	int nr_shdrs;
 	const Elf64_Shdr *shdrs;
 	const void *shstrtab;
-	const void *current_instr;
-	const void *end_instr;
 	unsigned x;
 
 	list_foreach(&p->loaded_objects, lo, list) {
@@ -796,8 +1075,6 @@ process_shlib(struct process *p, unsigned long start_vaddr,
 		if (shdrs[x].sh_type != SHT_SYMTAB &&
 		    shdrs[x].sh_type != SHT_DYNSYM)
 			continue;
-		printf("Symbol table in slot %d, link %d, info %d\n",
-		       x, shdrs[x].sh_link, shdrs[x].sh_info);
 		str_shdr = NULL;
 		if (shdrs[x].sh_link != 0 && shdrs[x].sh_link < nr_shdrs)
 			str_shdr = &shdrs[shdrs[x].sh_link];
@@ -823,24 +1100,6 @@ process_shlib(struct process *p, unsigned long start_vaddr,
 	discover_function(lo, "<entrypoint>", hdr->e_entry);
 
 	explore_functions(lo, (unsigned long)hdr - start_vaddr);
-
-#if 0
-	for (x = 0; x < nr_shdrs; x++) {
-		if (shdrs[x].sh_type != SHT_PROGBITS ||
-		    !(shdrs[x].sh_flags & SHF_ALLOC) ||
-		    !(shdrs[x].sh_flags & SHF_EXECINSTR))
-			continue;
-		current_instr = (void *)shdrs[x].sh_addr + (unsigned long)hdr - start_vaddr;
-		end_instr = current_instr + shdrs[x].sh_size;
-		while (current_instr < end_instr) {
-			current_instr += handle_instruction(
-				(const unsigned char *)hdr,
-				current_instr,
-				start_vaddr + ((unsigned long)current_instr - (unsigned long)hdr),
-				lo);
-		}
-	}
-#endif
 
 	munmap((void *)hdr, s);
 

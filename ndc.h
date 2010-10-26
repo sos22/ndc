@@ -306,8 +306,8 @@ struct instruction {
 	struct instr_template template;
 	unsigned char text[16];
 
-	bool next_resolved;
-	bool branch_resolved;
+	unsigned long stack_registers_on_entry;
+
 	union {
 		struct instruction *i;
 		unsigned long a;
