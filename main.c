@@ -656,32 +656,14 @@ static struct argp argp = {
 	.parser = argp_parser
 };
 
-int
-main(int argc, char *argv[])
+static struct process *
+start_process(char *argv[])
 {
+	int r;
 	struct process *child;
 	struct thread *head_thr;
-	int r;
-	struct sigaction timer_sa;
-	int arg_index;
 
-	bzero(&timer_sa, sizeof(timer_sa));
-
-	on_exit(maybe_dump_debug_ring, NULL);
-	signal(SIGABRT, (void (*)(int))dump_debug_ring);
-
-	timer_sa.sa_handler = itimer_handler;
-	sigemptyset(&timer_sa.sa_mask);
-	if (sigaction(SIGALRM, &timer_sa, NULL) < 0)
-		err(1, "installing SIGALRM handler");
-
-	errno = argp_parse(&argp, argc, argv, 0, &arg_index, NULL);
-	if (errno)
-		err(1, "parsing arguments");
-
-	target_binary = basename(argv[arg_index]);
-
-	child = spawn_child(argv[arg_index], argv + arg_index);
+	child = spawn_child(argv[0], argv);
 	assert(child->nr_threads == 1);
 	head_thr = list_first(&child->threads, struct thread, list);
 
@@ -702,6 +684,32 @@ main(int argc, char *argv[])
 	/* Close out our file descriptors to set it going properly. */
 	close(child->from_child_fd);
 	close(child->to_child_fd);
+
+}
+
+int
+main(int argc, char *argv[])
+{
+	struct process *child;
+	struct thread *head_thr;
+	struct sigaction timer_sa;
+	int arg_index;
+
+	on_exit(maybe_dump_debug_ring, NULL);
+	signal(SIGABRT, (void (*)(int))dump_debug_ring);
+	bzero(&timer_sa, sizeof(timer_sa));
+	timer_sa.sa_handler = itimer_handler;
+	sigemptyset(&timer_sa.sa_mask);
+	if (sigaction(SIGALRM, &timer_sa, NULL) < 0)
+		err(1, "installing SIGALRM handler");
+
+	errno = argp_parse(&argp, argc, argv, 0, &arg_index, NULL);
+	if (errno)
+		err(1, "parsing arguments");
+
+	target_binary = basename(argv[arg_index]);
+
+	child = start_process(argv + arg_index);
 
 	/* wait() and friends don't have convenient timeout arguments,
 	   and doing it with signals is a pain, so just have a child
