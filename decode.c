@@ -305,6 +305,11 @@ done_prefixes:
 		it->bytes_immediate = imm_opsize;
 		break;
 
+	case 0x6b: /* imul Gv, Ev, Ib */
+		it->modrm_access_type = ACCESS_R;
+		it->bytes_immediate = 1;
+		break;
+
 	case 0x80: /* Group 1 Eb, Ib */
 	case 0x81: /* Group 1 Ev, Iz */
 	case 0x83: /* Group 1 Ev, Ib */
@@ -560,7 +565,6 @@ discover_function(struct loaded_object *lo,
 		f->name = strdup(name);
 	f->head = addr;
 	list_push(f, list, &lo->functions);
-	printf("New function %s at %lx\n", name, addr);
 }
 
 static unsigned long
