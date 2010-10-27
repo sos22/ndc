@@ -10,6 +10,7 @@
 #include <argp.h>
 #include <assert.h>
 #include <ctype.h>
+#include <dirent.h>
 #include <elf.h>
 #include <err.h>
 #include <errno.h>
@@ -38,6 +39,8 @@ static const char *target_binary;
 static bool do_stats;
 static unsigned long nr_evals;
 static unsigned long nr_stack_evals;
+
+static pid_t pid_to_attach_to;
 
 #define PRELOAD_LIB_NAME "/local/scratch/sos22/notdc/ndc.so"
 #define PTRACE_OPTIONS (PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC | PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK | PTRACE_O_TRACEEXEC)
@@ -260,6 +263,7 @@ memory_access_breakpoint(struct thread *p, struct breakpoint *bp, void *ctxt,
 	set_regs(p, urs);
 
 	if (p->process->nr_threads == 1) {
+		printf("Still single-threaded?\n");
 		install_breakpoints(p, lo);
 		return;
 	}
@@ -360,6 +364,7 @@ static bool
 shlib_interesting(char *fname)
 {
 	char *f = basename(fname);
+	printf("Is %s interesting? (want %s\n", f, target_binary);
 	return strcmp(f, target_binary) == 0;
 }
 
@@ -621,6 +626,9 @@ static struct argp_option argp_options[] = {
 	  .key = 'b' },
 	{ .name = "stats",
 	  .key = 's' },
+	{ .name = "pid",
+	  .key = 'p',
+	  .arg = "PID"},
 	{ 0 }
 };
 
@@ -645,6 +653,9 @@ argp_parser(int key, char *arg, struct argp_state *state)
 		return 0;
 	case 's':
 		do_stats = true;
+		return 0;
+	case 'p':
+		pid_to_attach_to = parse_int_argument(arg);
 		return 0;
 	default:
 		return ARGP_ERR_UNKNOWN;
@@ -685,7 +696,104 @@ start_process(char *argv[])
 	close(child->from_child_fd);
 	close(child->to_child_fd);
 
+	return child;
 }
+
+static void
+attach_thread(struct process *proc, pid_t tid)
+{
+	struct thread *thr;
+	thr = calloc(sizeof(*thr), 1);
+	thr->process = proc;
+	thr->pid = tid;
+	thr->_stop_status = -1;
+	list_push(thr, list, &proc->threads);
+	proc->nr_threads++;
+
+	if (ptrace(PTRACE_ATTACH, tid) < 0)
+		err(1, "PTRACE_ATTACH(%d)", tid);
+	while (!thr_is_stopped(thr))
+		receive_ptrace_event(proc);
+
+	if (!WIFSTOPPED(thr_stop_status(thr)) ||
+	    WSTOPSIG(thr_stop_status(thr)) != SIGSTOP)
+		errx(1, "strange status %x from waitpid()",
+		     thr_stop_status(thr));
+
+	if (ptrace(PTRACE_SETOPTIONS,
+		   thr->pid,
+		   NULL,
+		   PTRACE_OPTIONS) < 0)
+		err(1, "ptrace(PTRACE_SETOPTIONS)");
+}
+
+static struct process *
+attach_process(pid_t pid)
+{
+	struct process *proc;
+	bool progress;
+
+	proc = calloc(sizeof(*proc), 1);
+	init_list_head(&proc->threads);
+	proc->from_child_fd = -1;
+	proc->to_child_fd = -1;
+	proc->tgid = pid;
+	init_list_head(&proc->breakpoints);
+	init_list_head(&proc->loaded_objects);
+
+	/* Okay.  Now we try to capture all of the threads which it's
+	 * already spawned.  This is kind of tricky, because it might
+	 * spawn some more while we're working, so need to iterate to
+	 * fixed point. */
+	/* (It's also possible that some threads might exit while
+	 * we're doing this, but that's okay because we'll pick up the
+	 * exit message as soon as we return and fix up from
+	 * there.) */
+
+	do {
+		DIR *d;
+		char *p;
+		progress = false;
+		asprintf(&p, "/proc/%d/task", pid);
+		d = opendir(p);
+		if (!d)
+			err(1, "opening %s", p);
+		free(p);
+		while (1) {
+			struct dirent *de;
+			pid_t new_pid;
+			struct thread *thr;
+
+		next_de:
+			de = readdir(d);
+			if (!de)
+				break;
+			if (!strcmp(de->d_name, ".") ||
+			    !strcmp(de->d_name, ".."))
+				continue;
+			new_pid = parse_int_argument(de->d_name);
+			/* Do we already know about this thread? */
+			list_foreach(&proc->threads, thr, list) {
+				if (thr->pid == new_pid)
+					goto next_de;
+			}
+			/* Thread isn't known.  Attach it. */
+			attach_thread(proc, new_pid);
+
+			/* There were unattached threads at the start
+			   of this iteration, so we need to go around
+			   again. */
+			progress = true;
+		}
+		closedir(d);
+	} while (progress);
+
+	linker_did_something(list_first(&proc->threads, struct thread, list), NULL, NULL, NULL);
+
+	/* Should now be fully attached. */
+	return proc;
+}
+
 
 int
 main(int argc, char *argv[])
@@ -709,7 +817,10 @@ main(int argc, char *argv[])
 
 	target_binary = basename(argv[arg_index]);
 
-	child = start_process(argv + arg_index);
+	if (pid_to_attach_to == 0)
+		child = start_process(argv + arg_index);
+	else
+		child = attach_process(pid_to_attach_to);
 
 	/* wait() and friends don't have convenient timeout arguments,
 	   and doing it with signals is a pain, so just have a child
