@@ -2,6 +2,9 @@ CPPFLAGS+=-Wall -g
 
 all: ndc.so test_dlopen test.so test_race1 ndc
 
+clean:
+	rm -f ndc.so test_dlopen test_race1 test.so ndc *.o *~ *.po
+
 ndc.so: ndc.po
 	gcc -shared -fPIC -g -o $@ $^
 
