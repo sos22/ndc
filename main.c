@@ -175,19 +175,55 @@ add_mem_access_instr(struct loaded_object *lo, unsigned long addr, int mode)
 	lo->nr_instrs++;
 }
 
+/* Store all of the reported races in a hash table, so that we can
+ * filter out duplicates. */
+struct reported_race {
+	struct reported_race *next;
+	unsigned long rip1;
+	unsigned long rip2;
+};
+/* This really doesn't want to be a power of two, or the hash gets
+   *much* weaker */
+#define RR_HASH_SIZE 129
+static struct reported_race *
+rr_hash[RR_HASH_SIZE];
+
 static void
 report_race(struct thread *thr1, struct thread *thr2)
 {
 	struct user_regs_struct urs1, urs2;
+	unsigned hash;
+	struct reported_race *rr;
+	static int nr_surpressed;
 
 	get_regs(thr1, &urs1);
 	get_regs(thr2, &urs2);
-	msg(100,
-	    "Race detected between pid %d RIP %lx and pid %d RIP %lx\n",
-	    thr1->pid,
-	    urs1.rip,
-	    thr2->pid,
-	    urs2.rip);
+	hash = (urs1.rip ^ urs2.rip) % RR_HASH_SIZE;
+	for (rr = rr_hash[hash]; rr; rr = rr->next) {
+		if (rr->rip1 == urs1.rip &&
+		    rr->rip2 == urs2.rip)
+			break;
+	}
+	if (rr) {
+		nr_surpressed++;
+		printf("Suppressed %d duplicates...\r",
+		       nr_surpressed);
+		fflush(stdout);
+	} else {
+		msg(100,
+		    "Race detected between pid %d RIP %lx and pid %d RIP %lx      \n",
+		    thr1->pid,
+		    urs1.rip,
+		    thr2->pid,
+		    urs2.rip);
+		nr_surpressed = 0;
+		rr = calloc(sizeof(*rr), 1);
+		rr->rip1 = urs1.rip;
+		rr->rip2 = urs2.rip;
+		rr->next = rr_hash[hash];
+		rr_hash[hash] = rr;
+	}
+
 	if (exit_on_first_race)
 		exit(0);
 }
