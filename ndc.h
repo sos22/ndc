@@ -112,6 +112,8 @@ struct thread {
 
 	int _stop_status; /* from wait() or -1 if it's currently
 			   * running */
+
+	bool exited;
 };
 
 struct function {

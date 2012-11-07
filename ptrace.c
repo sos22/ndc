@@ -292,10 +292,18 @@ set_watchpoint(struct process *p, unsigned long addr, unsigned size, int watch_r
 				;
 		assert(thr_is_stopped(thr));
 
+		/* Don't need to do anything if it's gone away */
+		if (thr->exited)
+			continue;
+
 		if (ptrace(PTRACE_POKEUSER, thr->pid,
 			   offsetof(struct user, u_debugreg[0]),
-			   addr) < 0)
+			   addr) < 0) {
+			printf("kill(%d,0) -> %d\n",
+			       thr->pid,
+			       kill(thr->pid, 0));
 			err(1, "Setting debug register 0 of %d", thr->pid);
+		}
 		if (ptrace(PTRACE_POKEUSER, thr->pid,
 			   offsetof(struct user, u_debugreg[7]),
 			   (size << 18) |
@@ -324,6 +332,9 @@ unset_watchpoint(struct watchpoint *w)
 		if (running)
 			while (!pause_child(thr))
 				;
+
+		if (thr->exited)
+			continue;
 
 		if (ptrace(PTRACE_POKEUSER, thr->pid,
 			   offsetof(struct user, u_debugreg[7]),

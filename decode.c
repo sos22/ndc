@@ -188,6 +188,7 @@ done_prefixes:
 		it->bytes_opcode = 2;
 		switch (instr[it->bytes_prefix + 1]) {
 		case 0x1f: /* nop */
+		case 0x18: /* prefetch */
 			it->modrm_access_type = ACCESS_NONE;
 			break;
 
@@ -208,6 +209,7 @@ done_prefixes:
 		case 0xf8 ... 0xff:
 
 		case 0x40 ... 0x4f: /* cmovcc Gv, Ev */
+		case 0xa3: /* bt Ev, Gv */
 		case 0xaf: /* imul Gv, Ev */
 		case 0xb6: /* movz Gv, Eb */
 		case 0xb7: /* movz Gv, Ew */
@@ -244,6 +246,7 @@ done_prefixes:
 			break;
 
 		case 0xc1: /* xadd Ev, Gv */
+		case 0xb1: /* cmpxchg Ev, Gv */
 			it->modrm_access_type = ACCESS_RW;
 			break;
 
@@ -252,6 +255,7 @@ done_prefixes:
 			it->bytes_immediate = 1;
 			break;
 
+		case 0x31: /* rdtsc */
 		case 0x77: /* emms */
 		case 0xc8 ... 0xcf: /* bswap reg */
 			break;
@@ -272,6 +276,8 @@ done_prefixes:
 		break;
 
 	case 0xd0 ... 0xd3: /* group 2 E{bv}, {1,Cl} */
+	case 0x87: /* xchg Ev, Gv */
+	case 0x86: /* xchg Eb, Gb */
 		it->modrm_access_type = ACCESS_RW;
 		break;
 
@@ -363,6 +369,7 @@ done_prefixes:
 	case 0x50 ... 0x5f: /* push and pop single register */
 	case 0x90: /* nop */
 	case 0x98: /* cltq */
+	case 0x99: /* cltd */
 	case 0xc3: /* ret */
 	case 0xc9: /* leave */
 	case 0xf4: /* hlt */
@@ -370,8 +377,11 @@ done_prefixes:
 	case 0xa6: /* cmps.  This does access memory, but it's in a
 		      moderately hard-to-handle way, so just ignore
 		      it. */
+	case 0xaa: /* stosb */
 	case 0xab: /* stos */
-	case 0xa5: /* movs */
+	case 0xa4: /* movs */
+	case 0xa5: /* movsb */
+	case 0xae: /* scas */
 		break;
 
 	case 0x3d: /* cmp rax, Iz */

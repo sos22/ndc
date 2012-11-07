@@ -25,11 +25,11 @@
 
 #include "ndc.h"
 
-static unsigned target_breakpoint_ratio = 10; /* One in n accesses
-						  gets a
-						  breakpoint. */
+static unsigned target_breakpoint_ratio = 2; /* One in n accesses
+						gets a
+						breakpoint. */
 static double reset_breakpoints_timeout = 1; /* in seconds */
-static double delay_when_breakpoint_hit = 0.001; /* in seconds */
+static double delay_when_breakpoint_hit = 0.1; /* in seconds */
 static bool exit_on_first_race;
 static bool writes_sufficient = true; /* Only set breakpoints on
 					 writes.  We always set
@@ -66,6 +66,8 @@ thr_stopped(struct thread *thr, int status)
 {
 	assert(status != -1);
 	assert(thr->_stop_status == -1);
+	if (WIFEXITED(status))
+		thr->exited = true;
 	thr->_stop_status = status;
 }
 
@@ -165,7 +167,7 @@ add_mem_access_instr(struct loaded_object *lo, unsigned long addr, int mode)
 	if (writes_sufficient && mode == ACCESS_R)
 		return;
 
-	msg(1, "Found memory accessing instruction at %#lx\n", addr);
+	//msg(1, "Found memory accessing instruction at %#lx\n", addr);
 
 	if (lo->nr_instrs == lo->nr_instrs_alloced) {
 		lo->nr_instrs_alloced *= 3;
