@@ -28,8 +28,8 @@
 static unsigned target_breakpoint_ratio = 2; /* One in n accesses
 						gets a
 						breakpoint. */
-static double reset_breakpoints_timeout = 1; /* in seconds */
-static double delay_when_breakpoint_hit = 0.1; /* in seconds */
+static double reset_breakpoints_timeout = 0.1; /* in seconds */
+static double delay_when_breakpoint_hit = 0.0001; /* in seconds */
 static bool exit_on_first_race;
 static bool writes_sufficient = true; /* Only set breakpoints on
 					 writes.  We always set
@@ -291,6 +291,7 @@ memory_access_breakpoint(struct thread *p, struct breakpoint *bp, void *ctxt,
 	struct watchpoint *wp;
 	struct itimerval itimer;
 	struct loaded_object *lo = bp->lo;
+	struct thread *early_resume;
 
 	assert(bp->lo);
 	sanity_check_lo(bp->lo);
@@ -341,6 +342,8 @@ memory_access_breakpoint(struct thread *p, struct breakpoint *bp, void *ctxt,
 	itimer.it_value.tv_usec = (delay_when_breakpoint_hit - itimer.it_value.tv_sec) * 1e6;
 	setitimer(ITIMER_REAL, &itimer, NULL);
 
+	early_resume = NULL;
+
 	do {
 		struct thread *other;
 		bool nothing_running = true;
@@ -369,9 +372,21 @@ memory_access_breakpoint(struct thread *p, struct breakpoint *bp, void *ctxt,
 					 * points.  Report the
 					 * race. */
 					report_race(p, other);
-					/* Kick it off again */
-					resume_child(other);
-
+					if (early_resume || random() % 2) {
+						/* Kick it off again */
+						resume_child(other);
+					} else {
+						/* Try letting the
+						   breakpointed thread
+						   go first. */
+						early_resume = other;
+						/* No longer need the timer */
+						memset(&itimer, 0,
+						       sizeof(itimer));
+						setitimer(ITIMER_REAL,
+							  &itimer,
+							  NULL);
+					}
 					nothing_running = false;
 				} else {
 					/* It was a breakpoint.  Leave
@@ -389,9 +404,12 @@ memory_access_breakpoint(struct thread *p, struct breakpoint *bp, void *ctxt,
 			setitimer(ITIMER_REAL, &itimer, NULL);
 			break;
 		}
-	} while (!timer_fired);
+	} while (!early_resume && !timer_fired);
 
 	unset_watchpoint(wp);
+
+	if (early_resume)
+		resume_child(early_resume);
 
 	install_breakpoints(p, lo);
 
